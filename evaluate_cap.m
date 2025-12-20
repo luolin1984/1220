@@ -62,10 +62,36 @@ try
         hard_fail = hard_fail || (~logical(out.gas_ok));
     end
 
-    % pull KPI numbers with safe fallbacks (soft-fail, not hard-fail)
+    % pull KPI numbers (robust mapping across iter versions)
     avg_cost = get_kpi_num(kpis, 'avg_cost', NaN);
-    curt     = get_kpi_num(kpis, 'curtail_ratio', NaN);
+    if ~isfinite(avg_cost)
+        avg_cost = get_kpi_num(kpis, 'avg_cost_per_MWh_USD', NaN);
+    end
+    if ~isfinite(avg_cost)
+        avg_cost = get_kpi_num(kpis, 'avg_cost_per_h_USD', NaN);
+    end
+
+    curt = get_kpi_num(kpis, 'curtail_ratio', NaN);
+    if ~isfinite(curt)
+        cm = get_kpi_num(kpis, 'curtail_MWh', NaN);
+        ra = get_kpi_num(kpis, 'ren_avail_MWh', NaN);
+        if isfinite(cm) && isfinite(ra) && ra > 0
+            curt = cm / ra;
+        else
+            util = get_kpi_num(kpis, 'ren_utilization', NaN);
+            if isfinite(util)
+                curt = 1 - util;
+            end
+        end
+    end
+    if isfinite(curt)
+        curt = min(max(curt, 0), 1);
+    end
+
     gas_risk = get_kpi_num(kpis, 'gas_risk', NaN);
+    if ~isfinite(gas_risk)
+        gas_risk = derive_gas_risk(kpis);
+    end
 
     % voltage deviation (preferred: kpis.voltage_dev_avg_pu)
     vdev_raw = get_kpi_num(kpis, 'voltage_dev_avg_pu', NaN);
@@ -96,7 +122,7 @@ try
         % fill missing with worst-but-finite values
         if ~isfinite(avg_cost), avg_cost = getfield_default(getfield_default(opts,'norm',struct()), 'cost_ref', 30); end
         if ~isfinite(curt),     curt     = 1.0; end
-        if ~isfinite(gas_risk), gas_risk = getfield_default(getfield_default(opts,'norm',struct()), 'gas_ref', 1e-3); end
+        if ~isfinite(gas_risk), gas_risk = getfield_default(getfield_default(opts,'norm',struct()), 'gas_ref', 1.0); end
     end
 
     % optionally upgrade invalid KPI to hard fail
@@ -108,7 +134,7 @@ try
     norm = getfield_default(opts,'norm',struct());
     cost_ref = getfield_default(norm,'cost_ref', 30);
     curt_ref = getfield_default(norm,'curt_ref', 1.0);
-    gas_ref  = getfield_default(norm,'gas_ref', 1e-3);
+    gas_ref  = getfield_default(norm,'gas_ref', 1.0);
 
     cost_n = clip01(avg_cost / max(cost_ref, eps));
     curt_n = clip01(curt     / max(curt_ref, eps));
@@ -155,6 +181,47 @@ function x = get_kpi_num(kpis, name, d)
 x = d;
 if isstruct(kpis) && isfield(kpis, name)
     v = kpis.(name);
+    if isnumeric(v) && isscalar(v)
+        x = double(v);
+    end
+end
+end
+
+function gas_risk = derive_gas_risk(kpis)
+% Derive a simple gas risk score in [0,1] from kpis.gas (if present).
+% 0 = safe, 1 = severe violation / invalid / missing.
+
+gas_risk = NaN;
+try
+    if ~isstruct(kpis) || ~isfield(kpis,'gas') || ~isstruct(kpis.gas)
+        return;
+    end
+    g = kpis.gas;
+    if isfield(g,'valid') && ~logical(g.valid)
+        gas_risk = 1.0;
+        return;
+    end
+
+    pr_ratio = get_num_field(g, 'press_violation_ratio', 0);
+    pr_maxpu = get_num_field(g, 'press_violation_max_pu', 0);
+    po_ratio = get_num_field(g, 'pipe_overload_ratio', 0);
+    pl_max   = get_num_field(g, 'pipe_loading_max', 1);
+
+    pr_ratio = min(max(pr_ratio, 0), 1);
+    po_ratio = min(max(po_ratio, 0), 1);
+    pr_maxpu = min(max(pr_maxpu, 0), 1);
+    pl_excess= min(max(pl_max - 1, 0), 1);
+
+    gas_risk = min(max(0.25*(pr_ratio + po_ratio + pr_maxpu + pl_excess), 0), 1);
+catch
+    gas_risk = 1.0;
+end
+end
+
+function x = get_num_field(S, name, d)
+x = d;
+if isstruct(S) && isfield(S,name)
+    v = S.(name);
     if isnumeric(v) && isscalar(v)
         x = double(v);
     end
