@@ -1229,7 +1229,14 @@ if isfield(opts,'vdev') && isstruct(opts.vdev)
     if isfield(opts.vdev,'vref')     && isfinite(opts.vdev.vref),     vref = opts.vdev.vref; end
 end
 
-[obj_vdev, vdev_kpi] = calc_voltage_deviation_acpf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen);
+% 优先使用 MPNG 的 AC-OPF 电压结果（若可用），避免 runpf 频繁不收敛导致 vdev 恒为 fail_pen
+if exist('mpng_ok','var') && mpng_ok && exist('eg','var') && isstruct(eg) && isfield(eg,'mpc') && isfield(eg.mpc,'bus') ...
+        && ~isempty(eg.mpc.bus) && isfield(ID,'VM') && size(eg.mpc.bus,2) >= ID.VM
+    NB_used = size(mpc_used.bus, 1);
+    [obj_vdev, vdev_kpi] = calc_voltage_deviation_from_mpng(eg.mpc, NB_used, ID, T, vref, vdev_fail_pen);
+else
+    [obj_vdev, vdev_kpi] = calc_voltage_deviation_acpf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen);
+end
 
 % 存入 kpis
 out.kpis.voltage_dev = vdev_kpi;   % 结构体：avg/max/failed_hours 等
@@ -1604,13 +1611,6 @@ out.curtail_MW     = curtail_MWh;
 out.eval_for_drl   = @(cap) iter_couple_most_mpng_24h_merged(cap, w_obj).score;
 out.comp_el_MW     = comp_el;
 out.most_ok        = ok_most;
-% [FIX] expose gas side convergence flag for RL hard-fail detection
-if exist('mpng_ok','var')
-    out.gas_ok = logical(mpng_ok);
-else
-    out.gas_ok = false;
-end
-
 out.kpis = struct( ...
     'total_cost_USD',        cost_total, ...
     'avg_cost_per_MWh_USD',  avg_cost_per_MWh, ...
@@ -1624,46 +1624,6 @@ out.kpis = struct( ...
     'profiles_applied',      profiles_ok, ...
     'gas',                   gas_kpi ...
     );
-
-% --- [FIX] Add compatibility KPIs expected by DRL wrappers (evaluate_cap) ---
-% avg_cost        : USD/MWh (scalar, smaller is better)
-% curtail_ratio   : [0,1]  (0=无弃电, 1=全弃)
-% gas_risk        : [0,1]  (0=安全, 1=严重违约/失败)
-out.kpis.avg_cost = avg_cost_per_MWh;
-
-% curtail ratio (robust)
-ra = safe_num(out.kpis, 'ren_avail_MWh', NaN);
-cm = safe_num(out.kpis, 'curtail_MWh', NaN);
-if isfinite(ra) && ra > 0 && isfinite(cm)
-    out.kpis.curtail_ratio = max(min(cm / ra, 1), 0);
-else
-    % 没有可再生输入时，定义为 0（不惩罚）
-    out.kpis.curtail_ratio = 0;
-end
-
-% simple gas risk in [0,1]
-if isfield(gas_kpi,'valid') && logical(gas_kpi.valid)
-    pr_ratio = safe_num(gas_kpi, 'press_violation_ratio', 0);
-    pr_maxpu = safe_num(gas_kpi, 'press_violation_max_pu', 0);
-    po_ratio = safe_num(gas_kpi, 'pipe_overload_ratio', 0);
-    pl_max   = safe_num(gas_kpi, 'pipe_loading_max', 1);
-
-    pr_ratio = max(min(pr_ratio, 1), 0);
-    po_ratio = max(min(po_ratio, 1), 0);
-    pr_maxpu = max(min(pr_maxpu, 1), 0);
-    pl_excess= max(min(max(pl_max - 1, 0), 1), 0);
-
-    out.kpis.gas_risk = max(min(0.25*(pr_ratio + po_ratio + pr_maxpu + pl_excess), 1), 0);
-else
-    out.kpis.gas_risk = 1.0;
-end
-
-% optional: keep a more “amplified” score for debugging (unbounded, larger=worse)
-try
-    out.kpis.gas_risk_score = gas_risk_score(gas_kpi);
-catch
-    out.kpis.gas_risk_score = NaN;
-end
 
 % --- [FIX] Preserve voltage deviation KPI computed above ---
 if exist('vdev_kpi','var') && ~isempty(vdev_kpi) && isstruct(vdev_kpi)
@@ -2507,6 +2467,79 @@ function m = local_smoothmax(v, beta)
     if ~isfinite(m) || ~isreal(m), m = vmax; end
 end
 
+
+function [obj_vdev, kpi] = calc_voltage_deviation_from_mpng(mpc_res, NB, ID, T, vref, fail_pen)
+% 计算 24h 电压偏差（优先用 MPNG AC-OPF 结果）
+% - mpc_res : MPNG 返回的电网结果（eg.mpc），其 bus(:,VM) 含电压幅值
+% - NB      : 单时段母线数（例如 33）；若 mpc_res 是多时段拼接（NB*T），则自动 reshape
+% - 失败/缺失时，用 fail_pen 兜底，保证指标有限
+
+    if nargin < 6 || isempty(fail_pen), fail_pen = 1.0; end
+    if nargin < 5 || isempty(vref),     vref     = 1.0; end
+    if nargin < 4 || isempty(T),        T        = 24; end
+    if nargin < 3 || isempty(ID) || ~isfield(ID,'VM'), ID.VM = 8; end
+    if nargin < 2 || isempty(NB) || NB <= 0, NB = 0; end
+
+    kpi = struct();
+    kpi.per_hour     = ones(T,1) * fail_pen;
+    kpi.failed_hours = 0;
+    kpi.avg          = fail_pen;
+    kpi.max          = fail_pen;
+    kpi.src          = "mpng:eg.mpc.bus(VM)";
+
+    try
+        if ~isstruct(mpc_res) || ~isfield(mpc_res,'bus') || isempty(mpc_res.bus) || size(mpc_res.bus,2) < ID.VM
+            error('mpc_res.bus missing or too few cols');
+        end
+
+        Vm = mpc_res.bus(:, ID.VM);
+        Vm = double(Vm(:));
+        n  = numel(Vm);
+
+        % 如果能按 NB reshape，就按“每小时一张电网”计算；否则退化为整体一次性计算
+        if NB > 0 && mod(n, NB) == 0
+            H = n / NB;
+            Vm_mat = reshape(Vm, NB, H);
+            HH = min(T, H);
+
+            for tt = 1:HH
+                v = Vm_mat(:, tt);
+                v = v(isfinite(v) & isreal(v));
+                if isempty(v)
+                    kpi.failed_hours = kpi.failed_hours + 1;
+                    kpi.per_hour(tt) = fail_pen;
+                else
+                    dv = v - vref;
+                    kpi.per_hour(tt) = sqrt(mean(dv.^2)); % RMS
+                end
+            end
+
+            if H < T
+                kpi.failed_hours = kpi.failed_hours + (T - H);
+                kpi.per_hour(H+1:end) = fail_pen;
+            end
+        else
+            v = Vm(isfinite(Vm) & isreal(Vm));
+            if isempty(v)
+                kpi.failed_hours = T;
+                kpi.per_hour(:)  = fail_pen;
+            else
+                dv = v - vref;
+                kpi.per_hour(:)  = sqrt(mean(dv.^2)); % same for all hours (fallback)
+                kpi.failed_hours = 0;
+            end
+        end
+    catch
+        kpi.failed_hours = T;
+        kpi.per_hour(:)  = fail_pen;
+    end
+
+    kpi.avg = mean(kpi.per_hour);
+    kpi.max = max(kpi.per_hour);
+    obj_vdev = kpi.avg;
+end
+
+
 function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc_base, Pg_in, ID, T, vref, fail_pen)
 % 计算 24h 电压偏差（AC PF）
 % - 输入 Pg_in 来自 MOST 的 ExpectedDispatch（可能是 internal 顺序）
@@ -2550,28 +2583,6 @@ function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc_base, Pg_in, ID, T, v
         % 写入该小时有功出力（offline 机组保持 0）
         mpc_t.gen(:, ID.PG) = 0;
         mpc_t.gen(idx_on_ext, ID.PG) = Pg_on_ext(:,tt);
-
-        % [FIX] AC-PF 需要把“有发电机的母线”提升为 PV 母线，否则这些机组的无功无法调节，
-        %       容易导致 runpf 失败，从而电压偏差被 fail_pen 兜底（训练时就会看到 vdev_raw 恒等于 vdev_cap）。
-        try
-            BUS_I_COL = 1;   % bus(:, BUS_I)
-            PV  = 2;
-            REF = 3;
-            gen_buses = unique(mpc_t.gen(idx_on_ext, ID.GEN_BUS));
-            bus_rows  = ismember(mpc_t.bus(:, BUS_I_COL), gen_buses);
-
-            keep = (mpc_t.bus(:, BUS_TYPE_COL) == REF) | (mpc_t.bus(:, BUS_TYPE_COL) == NONE);
-            set_rows = bus_rows & ~keep;
-
-            mpc_t.bus(set_rows, BUS_TYPE_COL) = PV;
-
-            % 初值贴近 vref，有助于收敛（不影响潮流的“指定值”逻辑）
-            if size(mpc_t.bus,2) >= VM_COL
-                mpc_t.bus(set_rows, VM_COL) = vref;
-            end
-        catch
-            % ignore
-        end
 
         % 给所有在线机组一个统一电压设定值，减少 PV/REF 机组 setpoint 缺失引发的异常
         if isfield(ID, 'VG') && ID.VG > 0
