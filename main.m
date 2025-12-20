@@ -5,20 +5,14 @@ ENV = struct();
 
 % --- action bounds (12D) ---
 % [cap1..cap6, z1..z6] : you can edit these to match your design
-ENV.cap_min = [ ...
-    0; 0; 0; 0; 0; 0; ...
-    0; 0.06; 0; 0.06; 0; 0.06 ...
-];
-ENV.cap_max = [ ...
-    50; 50; 50; 50; 50; 50; ...
-    1; 0.85; 1; 0.85; 1; 0.85 ...
-];
+ENV.cap_min = [  5;  2;  2;   0;  20;   0;   0; 0.06;  0; 0.06;  0; 0.06];
+ENV.cap_max = [ 80; 60; 60; 300; 120; 300;   1; 0.85;  1; 0.85;  1; 0.85];
 
 % --- reward shaping / normalization refs ---
 ENV.norm = struct();
 ENV.norm.cost_ref    = 30;    % normalize avg_cost by this (tune)
 ENV.norm.curt_ref    = 1.0;   % curtail_ratio already [0,1]
-ENV.norm.gas_ref     = 1e-3;  % normalize gas_risk by this (tune)
+ENV.norm.gas_ref     = 1.0;  % normalize gas_risk by this (tune)
 ENV.norm.vdev_cap    = 0.20;  % voltage dev cap (pu)
 ENV.norm.dA_lambda   = 0.05;  % action-rate penalty weight (tune)
 
