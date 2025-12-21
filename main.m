@@ -37,6 +37,8 @@ ENV.iter_opts.force_comp_as_el = ENV.force_comp_as_el;
 ENV.iter_opts.vdev.eval = 'acopf';
 % 可选：ACOPF失败是否回退到ACPF（默认 true）
 ENV.iter_opts.vdev.fallback_to_pf = true;
+ENV.iter_opts.vdev.p_eps = 1e-3;
+ENV.iter_opts.vdev.pf_enforce_q_lims = 1;
 
 % --- objective weights passed to iter_couple (if used there) ---
 ENV.w = [1 1 1 1];
