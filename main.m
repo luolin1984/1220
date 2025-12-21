@@ -33,11 +33,9 @@ ENV.iter_opts.comp_ids = ENV.comp_ids;
 ENV.iter_opts.force_comp_as_el = ENV.force_comp_as_el;
 
 % % 方式1：顶层字段
-% ENV.iter_opts.vdev_eval = 'acopf';
-% 方式2：放在 vdev 结构里
-ENV.iter_opts.vdev.eval = 'acopf';
-% 可选：ACOPF失败是否回退到ACPF（默认 true）
+ENV.iter_opts.vdev.eval = 'mpng'; % 可选：MPNG 没有 Vm 时再回退 acopf/acpf（代码里已做）
 ENV.iter_opts.vdev.fallback_to_pf = true;
+
 ENV.iter_opts.vdev.p_eps = 1e-3;
 ENV.iter_opts.vdev.pf_enforce_q_lims = 1;
 
