@@ -1241,10 +1241,29 @@ if isfield(opts,'vdev') && isstruct(opts.vdev)
     if isfield(opts.vdev,'pf_enforce_q_lims') && isfinite(opts.vdev.pf_enforce_q_lims), vdev_pf_enforce_q = opts.vdev.pf_enforce_q_lims; end
 end
 
+
+% --- 若 MPNG 已提供 AC-OPF 电压 (eg.mpc.bus(:,VM))，则直接用其 Vm 计算 vdev（最稳且最快） ---
+% vdev_eval 可选：'acpf'(默认) / 'acopf' / 'mpng'
+use_mpng_vm = false;
+if (strcmpi(vdev_eval,'mpng') || strcmpi(vdev_eval,'acopf')) && exist('mpng_ok','var') && mpng_ok && exist('eg','var') && isstruct(eg) && isfield(eg,'mpc') && isfield(eg.mpc,'bus')
+    try
+        [obj_vdev_mpng, vdev_kpi_mpng] = calc_voltage_deviation_from_eg(eg.mpc, ID, T, vref, vdev_fail_pen);
+        if isfinite(obj_vdev_mpng)
+            obj_vdev = obj_vdev_mpng;
+            vdev_kpi = vdev_kpi_mpng;
+            use_mpng_vm = true;
+        end
+    catch
+        use_mpng_vm = false;
+    end
+end
+
+if ~use_mpng_vm
 if strcmpi(vdev_eval,'acopf')
     [obj_vdev, vdev_kpi] = calc_voltage_deviation_acopf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_fallback_to_pf, vdev_p_eps, vdev_pf_enforce_q);
 else
     [obj_vdev, vdev_kpi] = calc_voltage_deviation_acpf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_pf_enforce_q);
+end
 end
 
 
@@ -2851,4 +2870,56 @@ function [idx_on_ext, Pg_on_ext, src] = map_Pg_to_ext_online_vdev(mpc_ext, Pg_in
 
     Pg_on_ext = cand{best};
     src = csrc{best};
+end
+
+function [obj_vdev, kpi] = calc_voltage_deviation_from_eg(mpc_eg, ID, T, vref, fail_pen)
+% 从 MPNG 返回的 eg.mpc (通常为 24h 扩展电网 AC-OPF 结果) 直接计算电压偏差
+% - 假设 bus 按小时连续堆叠：nb_per = nb_total / T
+% - 若不满足该形态，则返回 fail_pen
+    if nargin < 5 || isempty(fail_pen), fail_pen = 0.20; end
+    if nargin < 4 || isempty(vref), vref = 1.0; end
+    if nargin < 3 || isempty(T), T = 24; end
+
+    kpi = struct();
+    kpi.per_hour     = ones(T,1) * fail_pen;
+    kpi.failed_hours = 0;
+    kpi.avg          = fail_pen;
+    kpi.max          = fail_pen;
+    kpi.src          = "mpng:init";
+
+    if ~isstruct(mpc_eg) || ~isfield(mpc_eg,'bus') || size(mpc_eg.bus,1) < T
+        obj_vdev = fail_pen;
+        kpi.src = "mpng:invalid";
+        return;
+    end
+
+    define_constants;
+    nb_tot = size(mpc_eg.bus,1);
+    if mod(nb_tot, T) ~= 0
+        obj_vdev = fail_pen;
+        kpi.src = "mpng:nb_not_divisible";
+        return;
+    end
+    nb_per = nb_tot / T;
+
+    ok = 0;
+    for tt = 1:T
+        rows = (tt-1)*nb_per + (1:nb_per);
+        Vm = mpc_eg.bus(rows, VM);
+        bt = mpc_eg.bus(rows, BUS_TYPE);
+        mask = (bt ~= 4) & isfinite(Vm);
+        if ~any(mask)
+            kpi.failed_hours = kpi.failed_hours + 1;
+            kpi.per_hour(tt) = fail_pen;
+            continue;
+        end
+        dv = Vm(mask) - vref;
+        kpi.per_hour(tt) = sqrt(mean(dv.^2));
+        ok = ok + 1;
+    end
+
+    kpi.avg = mean(kpi.per_hour);
+    kpi.max = max(kpi.per_hour);
+    kpi.src = "mpng:Vm:ok=" + string(ok) + ":fail=" + string(kpi.failed_hours) + ":nb_per=" + string(nb_per);
+    obj_vdev = kpi.avg;
 end
