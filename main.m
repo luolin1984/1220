@@ -4,7 +4,6 @@ global ENV
 ENV = struct();
 
 % --- action bounds (12D) ---
-% [cap1..cap6, z1..z6] : you can edit these to match your design
 ENV.cap_min = [  5;  2;  2;   0;  20;   0;   0; 0.06;  0; 0.06;  0; 0.06];
 ENV.cap_max = [ 80; 60; 60; 300; 120; 300;   1; 0.85;  1; 0.85;  1; 0.85];
 
@@ -27,17 +26,12 @@ ENV.force_comp_as_el = true;
 
 % --- iter_couple options (forwarded) ---
 ENV.iter_opts = struct();
-% You can add any iter_couple_most_mpng_24h_merged options here if your function supports them:
-% ENV.iter_opts.someFlag = true;
+
 ENV.iter_opts.comp_ids = ENV.comp_ids;
 ENV.iter_opts.force_comp_as_el = ENV.force_comp_as_el;
 
-% % 方式1：顶层字段
 ENV.iter_opts.vdev.eval = 'mpng'; % 可选：MPNG 没有 Vm 时再回退 acopf/acpf（代码里已做）
 ENV.iter_opts.vdev.fallback_to_pf = true;
-
-ENV.iter_opts.vdev.p_eps = 1e-3;
-ENV.iter_opts.vdev.pf_enforce_q_lims = 1;
 
 % --- objective weights passed to iter_couple (if used there) ---
 ENV.w = [1 1 1 1];
