@@ -1229,11 +1229,23 @@ if isfield(opts,'vdev') && isstruct(opts.vdev)
     if isfield(opts.vdev,'vref')     && isfinite(opts.vdev.vref),     vref = opts.vdev.vref; end
 end
 
-% 优先使用 MPNG 的 AC-OPF 电压结果（若可用），避免 runpf 频繁不收敛导致 vdev 恒为 fail_pen
-if exist('mpng_ok','var') && mpng_ok && exist('eg','var') && isstruct(eg) && isfield(eg,'mpc') && isfield(eg.mpc,'bus') ...
-        && ~isempty(eg.mpc.bus) && isfield(ID,'VM') && size(eg.mpc.bus,2) >= ID.VM
-    NB_used = size(mpc_used.bus, 1);
-    [obj_vdev, vdev_kpi] = calc_voltage_deviation_from_mpng(eg.mpc, NB_used, ID, T, vref, vdev_fail_pen);
+% vdev 评估方式：默认 ACPF；可选 'acopf'（优先）→失败回退 ACPF →仍失败用 fail_pen
+vdev_eval = 'acpf';
+vdev_fallback_to_pf = true;
+if isfield(opts,'vdev_eval') && ~isempty(opts.vdev_eval)
+    vdev_eval = opts.vdev_eval;
+end
+if isfield(opts,'vdev') && isstruct(opts.vdev)
+    if isfield(opts.vdev,'eval') && ~isempty(opts.vdev.eval)
+        vdev_eval = opts.vdev.eval;
+    end
+    if isfield(opts.vdev,'fallback_to_pf') && ~isempty(opts.vdev.fallback_to_pf)
+        vdev_fallback_to_pf = logical(opts.vdev.fallback_to_pf);
+    end
+end
+
+if strcmpi(vdev_eval,'acopf')
+    [obj_vdev, vdev_kpi] = calc_voltage_deviation_acopf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_fallback_to_pf);
 else
     [obj_vdev, vdev_kpi] = calc_voltage_deviation_acpf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen);
 end
@@ -1611,9 +1623,52 @@ out.curtail_MW     = curtail_MWh;
 out.eval_for_drl   = @(cap) iter_couple_most_mpng_24h_merged(cap, w_obj).score;
 out.comp_el_MW     = comp_el;
 out.most_ok        = ok_most;
+
+out.mpng_ok        = mpng_ok;
+out.gas_ok         = mpng_ok;
+out.ok             = logical(ok_most) && logical(mpng_ok);
+
+% --- DRL-friendly KPI aliases (evaluate_cap expects these names) ---
+avg_cost = avg_cost_per_MWh;
+if ~isfinite(avg_cost), avg_cost = 1e6; end
+
+curtail_ratio = 0;
+if isfinite(ren_avail_MWh) && ren_avail_MWh > 0 && isfinite(curtail_MWh)
+    curtail_ratio = curtail_MWh / ren_avail_MWh;
+elseif isfinite(ren_util)
+    curtail_ratio = max(0, 1 - ren_util);
+end
+curtail_ratio = min(max(curtail_ratio, 0), 1);
+
+gas_risk = 1;   % invalid/failed gas run → worst
+if isstruct(gas_kpi) && isfield(gas_kpi,'valid') && logical(gas_kpi.valid)
+    vals = [];
+    if isfield(gas_kpi,'press_violation_ratio') && isfinite(gas_kpi.press_violation_ratio)
+        vals(end+1) = gas_kpi.press_violation_ratio;
+    end
+    if isfield(gas_kpi,'pipe_overload_ratio') && isfinite(gas_kpi.pipe_overload_ratio)
+        vals(end+1) = gas_kpi.pipe_overload_ratio;
+    end
+    if isfield(gas_kpi,'press_violation_max_pu') && isfinite(gas_kpi.press_violation_max_pu)
+        vals(end+1) = gas_kpi.press_violation_max_pu;
+    end
+    if isfield(gas_kpi,'pipe_loading_max') && isfinite(gas_kpi.pipe_loading_max)
+        vals(end+1) = max(0, gas_kpi.pipe_loading_max - 1);
+    end
+    if isempty(vals)
+        gas_risk = 0;
+    else
+        gas_risk = max(vals);
+    end
+end
+gas_risk = min(max(gas_risk, 0), 1);
+
 out.kpis = struct( ...
     'total_cost_USD',        cost_total, ...
     'avg_cost_per_MWh_USD',  avg_cost_per_MWh, ...
+    'avg_cost',              avg_cost, ...
+    'curtail_ratio',         curtail_ratio, ...
+    'gas_risk',              gas_risk, ...
     'avg_cost_per_h_USD',    avg_cost_per_h, ...
     'load_energy_MWh',       E_load_MWh, ...
     'ren_avail_MWh',         ren_avail_MWh, ...
@@ -1628,8 +1683,10 @@ out.kpis = struct( ...
 % --- [FIX] Preserve voltage deviation KPI computed above ---
 if exist('vdev_kpi','var') && ~isempty(vdev_kpi) && isstruct(vdev_kpi)
     out.kpis.voltage_dev = vdev_kpi;
-    if isfield(vdev_kpi,'avg'), out.kpis.voltage_dev_avg_pu = vdev_kpi.avg; end
-    if isfield(vdev_kpi,'max'), out.kpis.voltage_dev_max_pu = vdev_kpi.max; end
+    if isfield(vdev_kpi,'avg'),          out.kpis.voltage_dev_avg_pu = vdev_kpi.avg; end
+    if isfield(vdev_kpi,'max'),          out.kpis.voltage_dev_max_pu = vdev_kpi.max; end
+    if isfield(vdev_kpi,'failed_hours'), out.kpis.voltage_dev_failed_hours = vdev_kpi.failed_hours; end
+    if isfield(vdev_kpi,'src'),          out.kpis.voltage_dev_src = string(vdev_kpi.src); end
 end
 % 储能功率 & SOC & 绝对能量
 out.Pg_storage_wind   = [];
@@ -2467,79 +2524,6 @@ function m = local_smoothmax(v, beta)
     if ~isfinite(m) || ~isreal(m), m = vmax; end
 end
 
-
-function [obj_vdev, kpi] = calc_voltage_deviation_from_mpng(mpc_res, NB, ID, T, vref, fail_pen)
-% 计算 24h 电压偏差（优先用 MPNG AC-OPF 结果）
-% - mpc_res : MPNG 返回的电网结果（eg.mpc），其 bus(:,VM) 含电压幅值
-% - NB      : 单时段母线数（例如 33）；若 mpc_res 是多时段拼接（NB*T），则自动 reshape
-% - 失败/缺失时，用 fail_pen 兜底，保证指标有限
-
-    if nargin < 6 || isempty(fail_pen), fail_pen = 1.0; end
-    if nargin < 5 || isempty(vref),     vref     = 1.0; end
-    if nargin < 4 || isempty(T),        T        = 24; end
-    if nargin < 3 || isempty(ID) || ~isfield(ID,'VM'), ID.VM = 8; end
-    if nargin < 2 || isempty(NB) || NB <= 0, NB = 0; end
-
-    kpi = struct();
-    kpi.per_hour     = ones(T,1) * fail_pen;
-    kpi.failed_hours = 0;
-    kpi.avg          = fail_pen;
-    kpi.max          = fail_pen;
-    kpi.src          = "mpng:eg.mpc.bus(VM)";
-
-    try
-        if ~isstruct(mpc_res) || ~isfield(mpc_res,'bus') || isempty(mpc_res.bus) || size(mpc_res.bus,2) < ID.VM
-            error('mpc_res.bus missing or too few cols');
-        end
-
-        Vm = mpc_res.bus(:, ID.VM);
-        Vm = double(Vm(:));
-        n  = numel(Vm);
-
-        % 如果能按 NB reshape，就按“每小时一张电网”计算；否则退化为整体一次性计算
-        if NB > 0 && mod(n, NB) == 0
-            H = n / NB;
-            Vm_mat = reshape(Vm, NB, H);
-            HH = min(T, H);
-
-            for tt = 1:HH
-                v = Vm_mat(:, tt);
-                v = v(isfinite(v) & isreal(v));
-                if isempty(v)
-                    kpi.failed_hours = kpi.failed_hours + 1;
-                    kpi.per_hour(tt) = fail_pen;
-                else
-                    dv = v - vref;
-                    kpi.per_hour(tt) = sqrt(mean(dv.^2)); % RMS
-                end
-            end
-
-            if H < T
-                kpi.failed_hours = kpi.failed_hours + (T - H);
-                kpi.per_hour(H+1:end) = fail_pen;
-            end
-        else
-            v = Vm(isfinite(Vm) & isreal(Vm));
-            if isempty(v)
-                kpi.failed_hours = T;
-                kpi.per_hour(:)  = fail_pen;
-            else
-                dv = v - vref;
-                kpi.per_hour(:)  = sqrt(mean(dv.^2)); % same for all hours (fallback)
-                kpi.failed_hours = 0;
-            end
-        end
-    catch
-        kpi.failed_hours = T;
-        kpi.per_hour(:)  = fail_pen;
-    end
-
-    kpi.avg = mean(kpi.per_hour);
-    kpi.max = max(kpi.per_hour);
-    obj_vdev = kpi.avg;
-end
-
-
 function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc_base, Pg_in, ID, T, vref, fail_pen)
 % 计算 24h 电压偏差（AC PF）
 % - 输入 Pg_in 来自 MOST 的 ExpectedDispatch（可能是 internal 顺序）
@@ -2628,6 +2612,173 @@ function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc_base, Pg_in, ID, T, v
 
     % 用 avg 作为该目标的标量（可按你的奖励设计替换）
     obj_vdev = kpi.avg;
+end
+
+function [obj_vdev, kpi] = calc_voltage_deviation_acopf(mpc_base, Pg_in, ID, T, vref, fail_pen, fallback_to_pf)
+% 计算 24h 电压偏差（AC OPF 优先，失败回退 PF）
+% - 输入 Pg_in 来自 MOST 的 ExpectedDispatch（可能是 internal 顺序）
+% - 优先使用 runopf(AC) 获取电压幅值 VM；若失败且 fallback_to_pf=true，则回退 runpf
+% - 为提高可行性：将在线机组所在母线提升为 PV（REF 母线保持 REF），并允许 REF 机组吸收网损
+
+    if nargin < 7 || isempty(fallback_to_pf), fallback_to_pf = true; end
+    if nargin < 6 || isempty(fail_pen),       fail_pen = 1.0; end
+    if nargin < 5 || isempty(vref),           vref     = 1.0; end
+    if nargin < 4 || isempty(T),              T        = size(Pg_in, 2); end
+
+    kpi = struct();
+    kpi.per_hour     = ones(T,1) * fail_pen;
+    kpi.failed_hours = 0;
+    kpi.avg          = fail_pen;
+    kpi.max          = fail_pen;
+    kpi.src          = "acopf:init";
+
+    % --- 1) 将 Pg 映射到 external “在线机组”顺序 ---
+    [idx_on_ext, Pg_on_ext, map_src] = map_Pg_to_ext_online_vdev(mpc_base, Pg_in, ID);
+    kpi.src = "acopf:" + string(map_src);
+
+    % --- 2) ACOPF / ACPF 选项 ---
+    mpopt_acopf = mpoption('verbose', 0, 'out.all', 0, 'model', 'AC', ...
+                           'opf.ac.solver', 'MIPS', 'opf.start', 2, 'opf.violation', 1e-6, ...
+                           'pf.enforce_q_lims', 0);
+    mpopt_pf    = mpoption('verbose', 0, 'out.all', 0, 'pf.enforce_q_lims', 0);
+
+    % MATPOWER 8+：优先用 legacy core，避免 mp-core 的 update_z 警告刷屏
+    try
+        mpopt_acopf = mpoption(mpopt_acopf, 'exp.use_legacy_core', 1);
+        mpopt_pf    = mpoption(mpopt_pf,    'exp.use_legacy_core', 1);
+    catch
+        % older MATPOWER：无该选项则忽略
+    end
+
+    % 常量（避免 define_constants 依赖）
+    BUS_I_COL    = 1;
+    BUS_TYPE_COL = 2;
+    PQ  = 1; PV = 2; REF = 3; NONE = 4;
+
+    VM_COL = ID.VM;     % bus(:, VM)
+
+    % 保存 warning 状态（后面恢复）
+    w0 = warning;
+
+    for tt = 1:T
+        mpc_t = mpc_base;
+
+        % 写入该小时有功出力（先把所有机组 PG 归零，再写入在线机组）
+        mpc_t.gen(:, ID.PG) = 0;
+        mpc_t.gen(idx_on_ext, ID.PG) = Pg_on_ext(:,tt);
+
+        % 给在线机组一个统一电压设定（如果存在 VG 列）
+        if isfield(ID, 'VG') && ID.VG > 0
+            mpc_t.gen(idx_on_ext, ID.VG) = vref;
+        end
+
+        % --- 2.1 识别/修正 REF 母线（注意：GEN_BUS 是母线编号，不是行号） ---
+        busnum = mpc_t.bus(:, BUS_I_COL);
+
+        ref_row = find(mpc_t.bus(:, BUS_TYPE_COL) == REF, 1);
+        if isempty(ref_row)
+            % 如果没有 REF，选择第一个在线机组的母线作为 REF
+            ref_busnum = mpc_t.gen(idx_on_ext(1), ID.GEN_BUS);
+            ref_row = find(busnum == ref_busnum, 1);
+            if isempty(ref_row), ref_row = 1; end
+            mpc_t.bus(ref_row, BUS_TYPE_COL) = REF;
+        end
+        ref_busnum = mpc_t.bus(ref_row, BUS_I_COL);
+
+        % --- 2.2 将在线机组所在母线提升为 PV（REF 母线保持 REF） ---
+        gbus = unique(mpc_t.gen(idx_on_ext, ID.GEN_BUS));
+        for bb = reshape(gbus, 1, [])
+            brow = find(busnum == bb, 1);
+            if isempty(brow), continue; end
+            if mpc_t.bus(brow, BUS_TYPE_COL) == NONE, continue; end
+            if brow == ref_row
+                mpc_t.bus(brow, BUS_TYPE_COL) = REF;
+            else
+                mpc_t.bus(brow, BUS_TYPE_COL) = PV;
+            end
+        end
+
+        % --- 2.3 “锁死”非 REF 机组的 Pg（REF 机组留给网损/不平衡吸收） ---
+        ref_gens = find(mpc_t.gen(:, ID.GEN_STATUS) > 0 & mpc_t.gen(:, ID.GEN_BUS) == ref_busnum);
+        fix_mask = (mpc_t.gen(:, ID.GEN_STATUS) > 0);
+        fix_mask(ref_gens) = false;
+
+        if isfield(ID,'PMIN') && isfield(ID,'PMAX')
+            Pmin0 = mpc_t.gen(:, ID.PMIN);
+            Pmax0 = mpc_t.gen(:, ID.PMAX);
+            Pgfix = mpc_t.gen(:, ID.PG);
+            Pgfix = min(max(Pgfix, Pmin0), Pmax0);
+
+            mpc_t.gen(fix_mask, ID.PG)   = Pgfix(fix_mask);
+            mpc_t.gen(fix_mask, ID.PMIN) = Pgfix(fix_mask);
+            mpc_t.gen(fix_mask, ID.PMAX) = Pgfix(fix_mask);
+        end
+
+        % --- 3) 先尝试 ACOPF（若缺 gencost 则跳过直接回退 PF） ---
+        got_vm = false;
+        Vm = [];
+        bt = [];
+
+        if isfield(mpc_t, 'gencost') && ~isempty(mpc_t.gencost)
+            try
+                ws = warning;
+                warning('off','all');
+                [ropf, success] = runopf(mpc_t, mpopt_acopf);
+                warning(ws);
+
+                if success && isstruct(ropf) && isfield(ropf,'bus') && size(ropf.bus,2) >= VM_COL
+                    Vm = ropf.bus(:, VM_COL);
+                    bt = ropf.bus(:, BUS_TYPE_COL);
+                    got_vm = true;
+                end
+            catch
+                got_vm = false;
+            end
+        end
+
+        % --- 4) ACOPF 失败则回退 PF ---
+        if ~got_vm
+            if fallback_to_pf
+                try
+                    ws = warning;
+                    warning('off','all');
+                    [rpf, success_pf] = runpf(mpc_t, mpopt_pf);
+                    warning(ws);
+
+                    if success_pf && isstruct(rpf) && isfield(rpf,'bus') && size(rpf.bus,2) >= VM_COL
+                        Vm = rpf.bus(:, VM_COL);
+                        bt = rpf.bus(:, BUS_TYPE_COL);
+                        got_vm = true;
+                    end
+                catch
+                    got_vm = false;
+                end
+            end
+        end
+
+        if ~got_vm
+            kpi.failed_hours = kpi.failed_hours + 1;
+            kpi.per_hour(tt) = fail_pen;
+            continue;
+        end
+
+        mask = (bt ~= NONE) & isfinite(Vm);
+        if ~any(mask)
+            kpi.failed_hours = kpi.failed_hours + 1;
+            kpi.per_hour(tt) = fail_pen;
+            continue;
+        end
+
+        dv = Vm(mask) - vref;
+        kpi.per_hour(tt) = sqrt(mean(dv.^2));   % RMS 偏差
+    end
+
+    kpi.avg = mean(kpi.per_hour);
+    kpi.max = max(kpi.per_hour);
+
+    obj_vdev = kpi.avg;
+
+    warning(w0);
 end
 
 function [idx_on_ext, Pg_on_ext, src] = map_Pg_to_ext_online_vdev(mpc_ext, Pg_in, ID)
