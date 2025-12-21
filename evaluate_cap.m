@@ -1,11 +1,11 @@
 function [obs, reward, bad, loss, info] = evaluate_cap(action, prevAction, opts)
-% evaluate_cap_vdev4.m
+% evaluate_cap.m (patched: debug+stage, safer exception reporting)
 % Returns:
 %   obs   : 4x1 normalized KPIs in [0,1]
 %   reward: shaped reward in [-1, 1]
 %   bad   : hard-failure flag (1 means "treat as invalid transition")
-%   loss  : weighted loss in [0, +inf) (smaller is better)
-%   info  : diagnostics (vdev_raw/vdev_clip/src, dA, kpis, etc.)
+%   loss  : weighted loss in [0, +inf)
+%   info  : diagnostics (vdev_raw/vdev_clip/src, dA, stage, err, etc.)
 
 % defaults (safe)
 obs    = ones(4,1);
@@ -14,39 +14,45 @@ bad    = 1;
 loss   = 1.0;
 
 info = struct();
-info.action_in   = double(action(:));
-info.action_clip = double(action(:));
-info.dA          = NaN;
-info.vdev_raw    = NaN;
-info.vdev_clip   = getfield_default(getfield_default(opts,'norm',struct()), 'vdev_cap', 0.2);
-info.vdev_src    = "evaluate_cap:init";
-info.kpis        = struct();
-info.err         = "";
+info.stage = "init";
 
 try
+    info.stage = "read_bounds";
     cap_min = opts.cap_min;
     cap_max = opts.cap_max;
 
     % clip action
+    info.stage = "clip_action";
     a = double(action(:));
     a = min(max(a, cap_min), cap_max);
     info.action_clip = a;
 
     % action change penalty (normalized L1)
+    info.stage = "compute_dA";
     denom = (cap_max - cap_min);
     denom(denom <= 0) = 1;
     info.dA = mean(abs(a - double(prevAction(:))) ./ denom);
 
     % forward compressor options into iter opts
+    info.stage = "prepare_iter_opts";
     iter_opts = getfield_default(opts, 'iter_opts', struct());
     if isfield(opts, 'comp_ids'),         iter_opts.comp_ids = opts.comp_ids; end
     if isfield(opts, 'force_comp_as_el'), iter_opts.force_comp_as_el = opts.force_comp_as_el; end
 
     % call iter_couple
+    info.stage = "before_iter";
+    info.iter_path = string(which('iter_couple_most_mpng_24h_merged'));
+    if strlength(info.iter_path) == 0
+        error("iter_couple_most_mpng_24h_merged:not_on_path", ...
+            "iter_couple_most_mpng_24h_merged.m 不在 MATLAB path 上。请 addpath(genpath(项目根目录)) 后重试。");
+    end
+
     w = getfield_default(opts, 'w', [1 1 1 1]);
     out = iter_couple_most_mpng_24h_merged(a, w, iter_opts);
+    info.stage = "after_iter";
 
     % extract KPIs robustly
+    info.stage = "extract_kpis";
     kpis = struct();
     if isstruct(out) && isfield(out, 'kpis') && isstruct(out.kpis)
         kpis = out.kpis;
@@ -54,6 +60,7 @@ try
     info.kpis = kpis;
 
     % detect hard failure from out flags (if present)
+    info.stage = "detect_fail";
     hard_fail = false;
     if isstruct(out) && isfield(out,'most_ok')
         hard_fail = hard_fail || (~logical(out.most_ok));
@@ -62,17 +69,18 @@ try
         hard_fail = hard_fail || (~logical(out.gas_ok));
     end
 
-    % pull KPI numbers with safe fallbacks (soft-fail, not hard-fail)
+    % pull KPI numbers with safe fallbacks
+    info.stage = "read_kpi_nums";
     avg_cost = get_kpi_num(kpis, 'avg_cost', NaN);
     curt     = get_kpi_num(kpis, 'curtail_ratio', NaN);
     gas_risk = get_kpi_num(kpis, 'gas_risk', NaN);
 
     % voltage deviation (preferred: kpis.voltage_dev_avg_pu)
+    info.stage = "read_vdev";
     vdev_raw = get_kpi_num(kpis, 'voltage_dev_avg_pu', NaN);
     if isfinite(vdev_raw)
         info.vdev_src = "out.kpis.voltage_dev_avg_pu";
     else
-        % optional alternative names (if your iter function uses them)
         vdev_raw = get_kpi_num(kpis, 'vdev_raw', NaN);
         if isfinite(vdev_raw)
             info.vdev_src = "out.kpis.vdev_raw";
@@ -80,48 +88,18 @@ try
             info.vdev_src = "vdev:missing";
         end
     end
-    % enrich vdev source with producer tag (if available)
-    try
-        if isstruct(kpis)
-            if isfield(kpis,'voltage_dev_src')
-                info.vdev_src = string(info.vdev_src) + ":" + string(kpis.voltage_dev_src);
-            elseif isfield(kpis,'voltage_dev') && isstruct(kpis.voltage_dev) && isfield(kpis.voltage_dev,'src')
-                info.vdev_src = string(info.vdev_src) + ":" + string(kpis.voltage_dev.src);
-            end
-        end
-    catch
-        % ignore
-    end
 
-
-    vdev_cap  = getfield_default(getfield_default(opts,'norm',struct()), 'vdev_cap', 0.2);
+    norm = getfield_default(opts,'norm',struct());
+    vdev_cap  = getfield_default(norm, 'vdev_cap', 0.2);
     vdev_clip = min(max(vdev_raw, 0), vdev_cap);
-    if ~isfinite(vdev_raw)
-        vdev_raw  = vdev_cap;      % worst-but-finite fallback
-        vdev_clip = vdev_cap;
-    end
     info.vdev_raw  = vdev_raw;
     info.vdev_clip = vdev_clip;
 
-    % if any KPI missing, treat as soft-bad (penalize), but do not hard-fail
-    soft_bad = (~isfinite(avg_cost)) || (~isfinite(curt)) || (~isfinite(gas_risk));
-    if soft_bad
-        % fill missing with worst-but-finite values
-        if ~isfinite(avg_cost), avg_cost = getfield_default(getfield_default(opts,'norm',struct()), 'cost_ref', 30); end
-        if ~isfinite(curt),     curt     = 1.0; end
-        if ~isfinite(gas_risk), gas_risk = getfield_default(getfield_default(opts,'norm',struct()), 'gas_ref', 1e-3); end
-    end
-
-    % optionally upgrade invalid KPI to hard fail
-    if getfield_default(opts,'hard_fail_on_invalid_kpi', false) && soft_bad
-        hard_fail = true;
-    end
-
-    % normalize into obs in [0,1]
-    norm = getfield_default(opts,'norm',struct());
-    cost_ref = getfield_default(norm,'cost_ref', 30);
-    curt_ref = getfield_default(norm,'curt_ref', 1.0);
-    gas_ref  = getfield_default(norm,'gas_ref', 1e-3);
+    % normalize obs to [0,1]
+    info.stage = "normalize_obs";
+    cost_ref = getfield_default(norm,'cost_ref', 1);
+    curt_ref = getfield_default(norm,'curt_ref', 1e-3);
+    gas_ref  = getfield_default(norm,'gas_ref',  1e-3);
 
     cost_n = clip01(avg_cost / max(cost_ref, eps));
     curt_n = clip01(curt     / max(curt_ref, eps));
@@ -131,36 +109,52 @@ try
     obs = [cost_n; curt_n; gas_n; vdev_n];
 
     % loss and reward
-    % (simple: higher reward when KPIs small)
+    info.stage = "loss_reward";
     loss = mean(obs);
 
     dA_lambda = getfield_default(norm,'dA_lambda', 0.0);
-    loss = loss + dA_lambda * info.dA;
-
-    reward = 1.0 - loss;              % roughly in [-inf, 1]
-    reward = max(min(reward, 1.0), -1.0);
-
-    % hard fail override
-    if hard_fail
-        bad    = 1;
-        obs    = ones(4,1);
-        loss   = 1.0;
-        reward = getfield_default(opts,'bad_reward', -1.0);
-        info.vdev_src = string(info.vdev_src) + ":hard_fail";
-    else
-        bad = 0;
+    if isfinite(info.dA)
+        loss = loss + dA_lambda * info.dA;
     end
 
+    % reward in [-1,1] (simple: negative loss; clamp)
+    reward = max(min(1 - loss, 1), -1);
+
+    % finalize bad flag
+    bad = hard_fail || any(~isfinite(obs));
+    if bad
+        reward = getfield_default(opts,'bad_reward', -1.0);
+    end
+
+    info.stage = "done_ok";
+
 catch ME
+    if getfield_default(opts,'debug_rethrow',false)
+        rethrow(ME);
+    end
     bad    = 1;
     obs    = ones(4,1);
     loss   = 1.0;
     reward = getfield_default(opts,'bad_reward', -1.0);
 
-    info.err = getReport(ME, "basic", "hyperlinks", "off");
-    info.vdev_src = "evaluate_cap:exception";
-    info.vdev_raw = NaN;
+    info.err_id  = string(ME.identifier);
+    info.err_msg = string(ME.message);
+    info.err     = getReport(ME, "extended", "hyperlinks", "off");
+
+    if ~isfield(info,'vdev_src') || isempty(info.vdev_src)
+        info.vdev_src = "evaluate_cap:exception";
+    else
+        info.vdev_src = string(info.vdev_src) + ":evaluate_cap:exception";
+    end
+    info.vdev_raw  = NaN;
     info.vdev_clip = getfield_default(getfield_default(opts,'norm',struct()), 'vdev_cap', 0.2);
+
+    if ~isfield(info,'iter_path')
+        info.iter_path = string(which('iter_couple_most_mpng_24h_merged'));
+    end
+    if ~isfield(info,'stage')
+        info.stage = "unknown";
+    end
 end
 end
 
@@ -168,8 +162,10 @@ function x = get_kpi_num(kpis, name, d)
 x = d;
 if isstruct(kpis) && isfield(kpis, name)
     v = kpis.(name);
-    if isnumeric(v) && isscalar(v)
+    if isnumeric(v) && isscalar(v) && isfinite(v)
         x = double(v);
+    elseif isnumeric(v) && ~isempty(v) && all(isfinite(v(:)))
+        x = double(mean(v(:)));
     end
 end
 end
