@@ -31,6 +31,12 @@ ENV.iter_opts = struct();
 % ENV.iter_opts.someFlag = true;
 ENV.iter_opts.comp_ids = ENV.comp_ids;
 ENV.iter_opts.force_comp_as_el = ENV.force_comp_as_el;
+% % 方式1：顶层字段
+% ENV.iter_opts.vdev_eval = 'acopf';
+% 方式2：放在 vdev 结构里
+ENV.iter_opts.vdev.eval = 'acopf';
+% 可选：ACOPF失败是否回退到ACPF（默认 true）
+ENV.iter_opts.vdev.fallback_to_pf = true;
 
 % --- objective weights passed to iter_couple (if used there) ---
 ENV.w = [1 1 1 1];
