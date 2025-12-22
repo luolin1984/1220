@@ -22,7 +22,7 @@ ENV.verbose_live = true;
 
 % --- compressor configuration (KEY REQUEST) ---
 ENV.comp_ids         = [5 7];
-ENV.force_comp_as_el = true;
+ENV.force_comp_as_el = false;
 
 % --- iter_couple options (forwarded) ---
 ENV.iter_opts = struct();
@@ -39,137 +39,116 @@ ENV.w = [1 1 1 1];
 % --- episode horizon ---
 ENV.MaxSteps = 5;
 
-%%
-w_obj = ENV.w;
-lb = [ENV.cap_min(1:6); 1];
-ub = [ENV.cap_max(1:6); 33];
 
-% Options structure controlling the solver and simulation.  The fields
-% used by the underlying solver ``iter_couple_most_mpng_24h_merged``
-% include verbosity levels, solver tolerances and any other
-% problem‑specific flags.  See the corresponding solver implementation
-% for more details.  Feel free to customise these fields as needed.
-opts = struct();
-opts.verbose = false;    % suppress verbose solver output
-opts.maxIterations = 50; % maximum iterations for the nested solver
+lb = [ENV.cap_min(1:6); 1; 1; 1];
+ub = [ENV.cap_max(1:6); 33; 33; 33];
+ENV.cap_min = lb;
+ENV.cap_max = ub;
 
-%% Define the list of RL algorithms to compare
-algorithms = {'DDPG','TD3','PPO','A2C'};
 
-% Preallocate structure to hold results
+%% -------- RL environment specs ----------
+obsDim = 4;
+actDim = numel(ENV.cap_min);
+
+obsInfo = rlNumericSpec([obsDim 1], "LowerLimit", zeros(obsDim,1), "UpperLimit", ones(obsDim,1));
+obsInfo.Name = "obs";
+
+actInfo = rlNumericSpec([actDim 1], "LowerLimit", ENV.cap_min, "UpperLimit", ENV.cap_max);
+actInfo.Name = "action";
+
+env = rlFunctionEnv(obsInfo, actInfo, "capStepFcn", "capResetFcn");
+
+%% ---------------- 3) 训练设置（四个算法统一口径） ----------------
+cfg = struct();
+cfg.MaxEpisodes   = 30;
+cfg.MaxSteps      = ENV.MaxSteps;
+cfg.EvalEpisodes  = 10;    % 训练后评估回合数
+cfg.Seed          = 1;
+
+rng(cfg.Seed);
+
+trainOpts = rlTrainingOptions( ...
+    MaxEpisodes = cfg.MaxEpisodes, ...
+    MaxStepsPerEpisode = cfg.MaxSteps, ...
+    ScoreAveragingWindowLength = min(20, cfg.MaxEpisodes), ...
+    StopTrainingCriteria = "EpisodeCount", ...
+    StopTrainingValue = cfg.MaxEpisodes, ...
+    Verbose = true, ...
+    Plots = "training-progress");   % 如果你不想弹窗，改成 "none"
+
+%% ---------------- 4) 构建四个 agent ----------------
+agents = struct();
+
+% DDPG
+[actorDDPG, criticDDPG] = buildDDPGNetworks(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
+ddpgOpts = rlDDPGAgentOptions(SampleTime=1, DiscountFactor=0.99, TargetSmoothFactor=1e-3, ...
+    ExperienceBufferLength=1e6, MiniBatchSize=256);
+ddpgOpts.NoiseOptions.Variance = 0.15;        % exploration noise
+ddpgOpts.NoiseOptions.VarianceDecayRate = 1e-5;
+agents.DDPG = rlDDPGAgent(actorDDPG, criticDDPG, ddpgOpts);
+
+% TD3
+[actorTD3, critic1TD3, critic2TD3] = buildTD3Networks(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
+td3Opts = rlTD3AgentOptions(SampleTime=1, DiscountFactor=0.99, TargetSmoothFactor=5e-3, ...
+    ExperienceBufferLength=1e6, MiniBatchSize=256);
+% TD3 exploration + target-policy smoothing noise
+td3Opts.ExplorationModel.Variance = 0.15;
+td3Opts.ExplorationModel.VarianceDecayRate = 1e-5;
+td3Opts.TargetPolicySmoothModel.Variance = 0.20;
+td3Opts.TargetPolicySmoothModel.LowerLimit = -0.5;
+td3Opts.TargetPolicySmoothModel.UpperLimit = 0.5;
+agents.TD3 = rlTD3Agent(actorTD3, [critic1TD3 critic2TD3], td3Opts);
+
+% --- PPO (continuous Gaussian policy) ---
+agents.PPO = buildPPOAgent(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
+
+% --- A2C (用 AC agent + continuous Gaussian policy) ---
+agents.A2C = buildA2CAgent(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
+
+%% ---------------- 5) 依次训练 + 评估 ----------------
+names = {"DDPG","TD3","PPO","A2C"};
 results = struct();
+results.cfg = cfg;
+results.lb = lb;
+results.ub = ub;
+results.summary = struct();
 
-% Loop over all algorithms and perform training and evaluation
-for k = 1:numel(algorithms)
-    algName = algorithms{k};
-    fprintf('=== Training agent using %s algorithm ===\n', algName);
+for i = 1:numel(names)
+    name = names{i};
+    fprintf('\n================= Training %s =================\n', name);
+    agent = agents.(name);
+
     try
-        [agentCost, agentOut, agentObjVals] = trainAndEvaluateAgent(algName, w_obj, lb, ub, opts);
-        results.(algName).cost = agentCost;
-        results.(algName).output = agentOut;
-        results.(algName).objVals = agentObjVals;
-        fprintf('Finished training %s agent. Total cost: %.4f\n', algName, agentCost);
+        trainStats = train(agent, env, trainOpts);
+        results.(name).trainStats = trainStats;
+        results.(name).trainOK = true;
     catch ME
-        % Catch any errors during training or evaluation and store them
-        warning('An error occurred while training the %s agent: %s', algName, ME.message);
-        results.(algName).error = ME;
+        warning('Training %s failed: %s', name, ME.message);
+        results.(name).trainStats = [];
+        results.(name).trainOK = false;
+    end
+
+    fprintf('----------------- Evaluating %s -----------------\n', name);
+    try
+        evalRes = evaluateAgentSimple(env, agent, cfg.EvalEpisodes, cfg.MaxSteps);
+        results.(name).eval = evalRes;
+        results.(name).evalOK = true;
+    catch ME
+        warning('Evaluation %s failed: %s', name, ME.message);
+        results.(name).eval = [];
+        results.(name).evalOK = false;
     end
 end
 
-%% Traditional optimisation benchmark (e.g. PSO or deterministic solver)
-fprintf('=== Running traditional optimisation (PSO) ===\n');
-try
-    [capOpt, psoCost] = runTraditionalOptimisation(w_obj, lb, ub, opts);
-    results.PSO.capacity = capOpt;
-    results.PSO.cost = psoCost;
-    fprintf('Finished PSO optimisation. Total cost: %.4f\n', psoCost);
-catch ME
-    warning('An error occurred while running the traditional optimiser: %s', ME.message);
-    results.PSO.error = ME;
-end
-
-%% Display summary of results
-disp('=== Summary of algorithm performance ===');
-algFields = fieldnames(results);
-for i = 1:numel(algFields)
-    fname = algFields{i};
-    if isfield(results.(fname),'cost')
-        fprintf('%s: Cost = %.4f\n', fname, results.(fname).cost);
+%% ---------------- 6) 打印汇总 ----------------
+fprintf('\n================= Summary =================\n');
+for i = 1:numel(names)
+    name = names{i};
+    if isfield(results, name) && isfield(results.(name), "eval") && ~isempty(results.(name).eval)
+        s = results.(name).eval;
+        fprintf('%s | meanReturn=%.4f  std=%.4f  bestReturn=%.4f\n', ...
+            name, s.meanReturn, s.stdReturn, s.bestReturn);
     else
-        fprintf('%s: Error encountered\n', fname);
+        fprintf('%s | (no eval result)\n', name);
     end
 end
-
-
-% %% -------- RL environment specs ----------
-% obsDim = 4;
-% actDim = numel(ENV.cap_min);
-% 
-% obsInfo = rlNumericSpec([obsDim 1], "LowerLimit", zeros(obsDim,1), "UpperLimit", ones(obsDim,1));
-% obsInfo.Name = "obs";
-% 
-% actInfo = rlNumericSpec([actDim 1], "LowerLimit", ENV.cap_min, "UpperLimit", ENV.cap_max);
-% actInfo.Name = "action";
-% 
-% env = rlFunctionEnv(obsInfo, actInfo, "capStepFcn", "capResetFcn");
-% 
-% %% -------- Build agents (DDPG + TD3) ----------
-% agents = struct();
-% 
-% % DDPG
-% [actorDDPG, criticDDPG] = buildDDPGNetworks(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
-% ddpgOpts = rlDDPGAgentOptions( ...
-%     SampleTime=1, ...
-%     DiscountFactor=0.99, ...
-%     TargetSmoothFactor=1e-3, ...
-%     ExperienceBufferLength=1e6, ...
-%     MiniBatchSize=256);
-% ddpgOpts.NoiseOptions.Variance = 0.15;        % exploration noise
-% ddpgOpts.NoiseOptions.VarianceDecayRate = 1e-5;
-% agents.DDPG = rlDDPGAgent(actorDDPG, criticDDPG, ddpgOpts);
-% 
-% % TD3
-% [actorTD3, critic1TD3, critic2TD3] = buildTD3Networks(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
-% td3Opts = rlTD3AgentOptions( ...
-%     SampleTime=1, ...
-%     DiscountFactor=0.99, ...
-%     TargetSmoothFactor=5e-3, ...
-%     ExperienceBufferLength=1e6, ...
-%     MiniBatchSize=256);
-% % TD3 exploration + target-policy smoothing noise
-% td3Opts.ExplorationModel.Variance = 0.15;
-% td3Opts.ExplorationModel.VarianceDecayRate = 1e-5;
-% td3Opts.TargetPolicySmoothModel.Variance = 0.20;
-% td3Opts.TargetPolicySmoothModel.LowerLimit = -0.5;
-% td3Opts.TargetPolicySmoothModel.UpperLimit = 0.5;
-% agents.TD3 = rlTD3Agent(actorTD3, [critic1TD3 critic2TD3], td3Opts);
-% 
-% %% -------- Choose agent to train ----------
-% cfg = struct();
-% cfg.train_agent = "TD3";  % "TD3" | "DDPG" | "BOTH"
-% cfg.maxEpisodes = 30;
-% cfg.maxStepsPerEpisode = ENV.MaxSteps;
-% 
-% trainOpts = rlTrainingOptions( ...
-%     MaxEpisodes=cfg.maxEpisodes, ...
-%     MaxStepsPerEpisode=cfg.maxStepsPerEpisode, ...
-%     ScoreAveragingWindowLength=20, ...
-%     StopTrainingCriteria="EpisodeCount", ...
-%     StopTrainingValue=cfg.maxEpisodes, ...
-%     Verbose=true, ...
-%     Plots="training-progress");
-% 
-% stats = struct();
-% switch upper(string(cfg.train_agent))
-%     case "DDPG"
-%         stats.DDPG = train(agents.DDPG, env, trainOpts);
-%     case "TD3"
-%         stats.TD3  = train(agents.TD3, env, trainOpts);
-%     case "BOTH"
-%         stats.DDPG = train(agents.DDPG, env, trainOpts);
-%         stats.TD3  = train(agents.TD3, env, trainOpts);
-%     otherwise
-%         error("Unknown cfg.train_agent = %s", cfg.train_agent);
-% end
-% 
-% out = struct("env", env, "agents", agents, "stats", stats, "cfg", cfg);
