@@ -106,6 +106,19 @@ Ppv1    = cap_in(2);
 Ppv2    = cap_in(3);
 Pgt_max = cap_in(5);
 
+% === [NEW] 电锅炉/热泵：cap_in(4) 作为额定电功率上限（MW）；=0 表示不用 ===
+P_boiler_max = 0;
+if numel(cap_in) >= 4 && isfinite(cap_in(4))
+    P_boiler_max = max(0, cap_in(4));
+end
+
+% === [NEW] 储能：cap_in(6) 作为储能功率上限（MW）；=0 表示无储能 ===
+P_stor_max = 0;
+if numel(cap_in) >= 6 && isfinite(cap_in(6))
+    P_stor_max = max(0, cap_in(6));
+end
+
+
 % 2) 默认母线（兼容老版本：没有选址动作时，仍然用原来的 8/13/30）
 bus_wind = 8;
 bus_pv1  = 13;
@@ -185,6 +198,32 @@ if isfield(opts,'storage') && ~isempty(opts.storage)
     end
     if isfield(opts.storage,'eta_dis') && ~isempty(opts.storage.eta_dis)
         eta_dis = opts.storage.eta_dis;
+    end
+end
+
+% === [PATCH] cap_in(6) -> MOST storage（带 SOC） ===
+% 规则：
+%  - 若用户没显式给 opts.storage.wind / opts.storage.pv1，则默认把储能挂在 wind 母线；
+%  - cap_in(6)=P_stor_max (MW)，Emax 默认 4h：Emax=4*P_stor_max，SOC0=0.5；
+if ~isfield(opts,'storage') || isempty(opts.storage)
+    opts.storage = struct();   % 你前面已有这行也没关系
+end
+
+% 若 cap_in(6)>0 且 opts.storage 里没有任何单元配置 → 自动生成 wind 侧储能
+has_any_storage_cfg = isfield(opts.storage,'wind') || isfield(opts.storage,'pv1');
+if (P_stor_max > 0) && ~has_any_storage_cfg
+    opts.storage.wind = struct('bus', bus_wind, 'Pmax', P_stor_max, 'Emax', 4*P_stor_max, 'SOC0', 0.5);
+end
+
+% 若用户给了 wind/pv1 但没写 Pmax，则用 cap_in(6) 补上（仍然保持“用户优先”）
+if (P_stor_max > 0) && isfield(opts.storage,'wind') && ~isempty(opts.storage.wind)
+    if ~isfield(opts.storage.wind,'Pmax') || isempty(opts.storage.wind.Pmax)
+        opts.storage.wind.Pmax = P_stor_max;
+    end
+end
+if (P_stor_max > 0) && isfield(opts.storage,'pv1') && ~isempty(opts.storage.pv1)
+    if ~isfield(opts.storage.pv1,'Pmax') || isempty(opts.storage.pv1.Pmax)
+        opts.storage.pv1.Pmax = P_stor_max;
     end
 end
 
@@ -492,23 +531,31 @@ end
 alpha = 0.6;
 COP   = 1.8;
 
-% 热负荷 & 等效电负荷
-heat_th   = alpha * Pd_base * load_shape;   % MW_th, 24h 热负荷
-el_boiler = heat_th / COP;                 % MW_el, 等效电锅炉有功
+% 热负荷 & 等效电负荷（电锅炉/热泵）
+heat_th        = alpha * Pd_base * load_shape;   % MW_th, 24h 热负荷
+el_boiler_cmd  = heat_th / COP;                  % MW_el（未受容量约束的“需求”）
+
+% === [PATCH] 优化器决定用不用：cap_in(4)=P_boiler_max；逐小时裁剪 ===
+if P_boiler_max > 0
+    el_boiler = min(el_boiler_cmd, P_boiler_max);
+else
+    el_boiler = zeros(size(el_boiler_cmd));
+end
 
 % 按各负荷母线 Pd 权重分摊电锅炉功率
 load_buses = find(mpc.bus(:, ID.PD) > 0);
 w_share    = mpc.bus(load_buses, ID.PD);
 w_share    = w_share / max(1e-9, sum(w_share));
 
-vals_bus = zeros(T,1,numel(load_buses));
-for k = 1:numel(load_buses)
-    vals_bus(:,1,k) = el_boiler(:) * w_share(k);
+if any(el_boiler(:) > 1e-9)
+    vals_bus = zeros(T,1,numel(load_buses));
+    for k = 1:numel(load_buses)
+        vals_bus(:,1,k) = el_boiler(:) * w_share(k);
+    end
+
+    profiles(end+1) = struct('type','mpcData','table',CT_TLOAD,'rows',load_buses, ...
+        'col',CT_LOAD_ALL_P,'chgtype',CT_ADD,'values',vals_bus);
 end
-
-profiles(end+1) = struct('type','mpcData','table',CT_TLOAD,'rows',load_buses, ...
-    'col',CT_LOAD_ALL_P,'chgtype',CT_ADD,'values',vals_bus);
-
 
 % === 新增：让基准负荷本身也随时间变化（早晚高 / 中午低） ===
 load_buses = find(mpc.bus(:, ID.PD) > 0);
@@ -944,51 +991,86 @@ end
 % 为了避免 MOST 再次不收敛，这里沿用了 5) 中的 LOAD_SCALE_LIST 降级逻辑。
 
 if ok_most && ~isempty(comp_el)
-    NB = size(mpc.bus, 1);
-    add_load_MW = zeros(NB, 1);   % 每个电网母线上，由压缩机带来的额外负荷功率（MW）
+    % --- 容错：确保 comp_el 是 ncomp × T ---
+    if size(comp_el,2) ~= T && size(comp_el,1) == T
+        comp_el = comp_el.';   % 变成 ncomp×T
+    end
+    if size(comp_el,2) ~= T
+        warning('[COUPLED] comp_el 尺寸为 %dx%d，不是 ncomp×T（T=%d），跳过强耦合迭代。', ...
+            size(comp_el,1), size(comp_el,2), T);
+    end
+        NB = size(mpc.bus, 1);
 
-    try
-        if isfield(connect, 'interc') && isfield(connect.interc, 'comp') && ~isempty(connect.interc.comp)
-            % connect.interc.comp: [COMP_ID, BUS_ID]
-            map = connect.interc.comp;
-            nmap = size(map, 1);
+        % 每个母线每小时的压缩机附加负荷：NB×T
+        add_load_NT = zeros(NB, T);
 
-            % 决定 bus 号所在列：若 ID.BUS_I 存在就用它，否则用第1列
-            if exist('ID', 'var') && isstruct(ID) && isfield(ID, 'BUS_I')
-                col_bus = ID.BUS_I;
-            else
-                col_bus = 1;   % MATPOWER 标准：bus(:,1) 即 BUS_I
-            end
+        try
+            if isfield(connect,'interc') && isfield(connect.interc,'comp') && ~isempty(connect.interc.comp)
+                map  = connect.interc.comp;   % [COMP_ID, BUS_ID]
+                nmap = size(map, 1);
 
-            for kk = 1:nmap
-                cid = map(kk, 1);     % 压缩机行号（mgc.comp 的行）
-                bid = map(kk, 2);     % 电网母线号（mpc.bus 的 BUS_I）
-                % 容错：索引越界就跳过
-                if cid >= 1 && cid <= size(comp_el, 1)
-                    Pcid = comp_el(cid, 1);  % MW，当前代码中24h恒定
-                    % 找到这个 BUS_ID 在 mpc.bus 中对应的行号
-                    bus_row = find(mpc.bus(:, col_bus) == bid, 1);
-                    if ~isempty(bus_row)
-                        add_load_MW(bus_row) = add_load_MW(bus_row) + Pcid;
-                    end
+                % BUS号所在列：MATPOWER bus(:,1) 即 BUS_I
+                col_bus = 1;
+                if exist('ID','var') && isstruct(ID) && isfield(ID,'BUS_I')
+                    col_bus = ID.BUS_I; %#ok<NASGU> % 你ID里目前没存BUS_I，这行留着也无伤
+                end
+
+                for kk = 1:nmap
+                    cid = map(kk,1);    % 压缩机行号（mgc.comp 的行）
+                    bid = map(kk,2);    % 电网母线号（BUS_I）
+
+                    if cid < 1 || cid > size(comp_el,1), continue; end
+
+                    bus_row = find(mpc.bus(:,1) == bid, 1);  % 用 bus(:,BUS_I)
+                    if isempty(bus_row), continue; end
+
+                    % ★正确的累加：写回 add_load_NT 的一整行(1×T)
+                    add_load_NT(bus_row, :) = add_load_NT(bus_row, :) + comp_el(cid, :);
                 end
             end
+        catch ME_map
+            warning('[COUPLED] 压缩机负荷-母线映射失败：%s，跳过强耦合迭代。', ME_map.message);
+            add_load_NT(:,:) = 0;
         end
-    catch ME_map
-        warning('[COUPLED] 压缩机负荷-母线映射失败：%s，跳过强耦合迭代。', ME_map.message);
-        add_load_MW(:) = 0;
-    end
+        % 用 add_load_NT 判断是否有压缩机负荷
+        if any(add_load_NT(:) > 1e-6)
+            Psum_hour = sum(add_load_NT, 1);     % 1×T
+            dt_c = 1;
+            try, if exist('mdE','var') && isfield(mdE,'Delta_T') && ~isempty(mdE.Delta_T), dt_c = mdE.Delta_T; end, catch, end
+            Esum_MWh = sum(Psum_hour) * dt_c;
 
+            fprintf('[COUPLED] 压缩机负荷反馈：P[min/avg/max]=%.3f/%.3f/%.3f MW, E=%.3f MWh\n', ...
+                min(Psum_hour), mean(Psum_hour), max(Psum_hour), Esum_MWh);
 
-    if any(add_load_MW > 1e-6)
-        fprintf('[COUPLED] 将压缩机电耗作为固定负荷反馈到 MOST，总功率 = %.3f MW\n', sum(add_load_MW));
+            % profiles2 构造保持你原来的写法即可（rows_comp/vals_comp 那段没问题）
+        else
+            fprintf('[COUPLED] 压缩机电耗为零或未识别，跳过强耦合迭代。\n');
+        end
 
-        % 1) 基于 add_load_MW 构造一个新的负荷 profile（CT_TLOAD / CT_LOAD_ALL_P）
-        rows_comp = find(add_load_MW > 1e-6);      % 只给有压缩机负荷的母线加 profile
-        vals_comp = zeros(T, 1, numel(rows_comp)); % T×1×N_bus
+    if any(add_load_NT > 1e-6)
+        fprintf('[COUPLED] 将压缩机电耗作为固定负荷反馈到 MOST，总功率 = %.3f MW\n', sum(add_load_NT));
+        % dt（小时）：优先用 mdE.Delta_T，否则按 1h
+        dt_c = 1;
+        try
+            if exist('mdE','var') && isfield(mdE,'Delta_T') && ~isempty(mdE.Delta_T)
+                dt_c = mdE.Delta_T;
+            end
+        catch
+        end
+
+        Psum_hour = sum(add_load_NT, 1);              % 1×T
+        Esum_MWh  = sum(Psum_hour) * dt_c;            % MWh
+
+        fprintf('[COUPLED] 将压缩机电耗作为时变负荷反馈到 MOST：');
+        fprintf(' P_total[min/avg/max]=%.3f/%.3f/%.3f MW, E24=%.3f MWh\n', ...
+            min(Psum_hour), mean(Psum_hour), max(Psum_hour), Esum_MWh);
+
+        % 1) 构造新的负荷 profile（只对“有负荷”的母线）
+        rows_comp = find(max(add_load_NT, [], 2) > 1e-6);  % bus 行号（mpc.bus 的行索引）
+        vals_comp = zeros(T, 1, numel(rows_comp));         % T×1×Nbus
         for kk = 1:numel(rows_comp)
             b = rows_comp(kk);
-            vals_comp(:, 1, kk) = add_load_MW(b);  % 每个小时都是相同的 MW
+            vals_comp(:, 1, kk) = add_load_NT(b, :).';     % ★按小时写入★
         end
 
         profiles2 = profiles;
@@ -1174,10 +1256,10 @@ end
 
 % 3) 基线负荷与总发电量（MWh）
 E_gen_MWh  = NaN;
-if ~isempty(Pg2), E_gen_MWh = sum(Pg2(:)); end
+if ~isempty(Pg2), E_gen_MWh = sum(Pg2(:)) * dt; end
 
 % 4) 电锅炉状态文本
-inc_cmd = sum(el_boiler);
+inc_cmd = sum(el_boiler) * dt;
 if ok_most
     boiler_report_txt = sprintf('[APPLIED] 电锅炉按负荷曲线注入 MOST：seen=%.3f MWh（等同于 cmd=%.3f）', inc_cmd, inc_cmd);
 else
@@ -1185,7 +1267,7 @@ else
 end
 
 % 5) 可再生统计
-ren_avail_MWh = sum(pmx_by_gen([idx_wind; idx_pv1; idx_pv2], :), "all");
+ren_avail_MWh = sum(pmx_by_gen([idx_wind; idx_pv1; idx_pv2], :), "all") * dt;
 ren_sched_MWh = NaN; curtail_MWh = NaN; therm_sched_MWh = NaN; ren_util = NaN;
 
 vre_msg = '';
@@ -1209,9 +1291,9 @@ if ~isempty(Pg2)
     if any(over_raw(:)), vre_msg = '【提示】检测到 VRE 调度超过可用上限，已按上限裁剪统计（请检查 PMAX(t) profile 是否生效）。'; end
 
     Pg_vre_clip     = min(Pg_vre, Av_vre);
-    ren_sched_MWh   = sum(Pg_vre_clip(:));
+    ren_sched_MWh   = sum(Pg_vre_clip(:)) * dt;
     curtail_MWh     = max(0, ren_avail_MWh - ren_sched_MWh);
-    therm_sched_MWh = sum(Pg2(:)) - ren_sched_MWh;
+    therm_sched_MWh = sum(Pg2(:)) * dt - ren_sched_MWh;
     ren_util        = ren_sched_MWh / max(1e-9, ren_avail_MWh);
 end
 
@@ -1224,6 +1306,9 @@ end
 % 超参数（可用 opts.vdev 覆盖）
 vdev_fail_pen = 0.20;        % 潮流失败时的单小时惩罚（pu 量级）
 vref = 1.0;                  % 参考电压
+vdev_pf_enforce_q = false;   % 给所有路径一个默认
+vdev_p_eps = 1e-6;           % 同理：acopf路径里也用得到的话就一起前置
+
 if isfield(opts,'vdev') && isstruct(opts.vdev)
     if isfield(opts.vdev,'fail_pen') && isfinite(opts.vdev.fail_pen), vdev_fail_pen = opts.vdev.fail_pen; end
     if isfield(opts.vdev,'vref')     && isfinite(opts.vdev.vref),     vref = opts.vdev.vref; end
@@ -1244,6 +1329,27 @@ if isfield(opts,'vdev') && isstruct(opts.vdev)
     end
 end
 
+% ===== 构造每小时母线负荷 PD_NT（NB×T），与 MOST profiles 口径尽量一致 =====
+NB = size(mpc_used.bus, 1);
+PD_NT = repmat(mpc_used.bus(:,ID.PD), 1, T);
+
+% 基准负荷的早晚高/中午低增量（与你 vals_bus2 一致：用“原始Pd_bus0”）
+PD0_all = mpc.bus(:,ID.PD);     % 这里用最初的 mpc（未缩放那份）
+for tt = 1:T
+    PD_NT(:,tt) = PD_NT(:,tt) + (scale(tt) - 1.0) * PD0_all;
+end
+
+% 电锅炉分摊到各负荷母线
+if any(el_boiler(:) > 1e-9)
+    % w_share 是 (nload×1)，el_boiler(:).' 是 (1×T) → 得到 (nload×T)
+    PD_NT(load_buses, :) = PD_NT(load_buses, :) + (w_share * el_boiler(:).');
+end
+
+% 压缩机负荷（强耦合那段产生的 add_load_NT）
+if exist('add_load_NT','var') && ~isempty(add_load_NT)
+    PD_NT = PD_NT + add_load_NT;
+end
+
 % --- vdev 评估：优先使用 MPNG 的 AC-OPF 结果（若可用）；否则按 acopf/acpf 计算 ---
 use_mpng_v = strcmpi(vdev_eval,'mpng') || strcmpi(vdev_eval,'acopf');  % acopf 时也先尝试用 mpng（更稳）
 used_mpng_v = false;
@@ -1259,9 +1365,13 @@ end
 
 if ~used_mpng_v
     if strcmpi(vdev_eval,'acopf')
+        % defaults for voltage deviation helpers
+        if ~exist('vdev_p_eps','var') || isempty(vdev_p_eps), vdev_p_eps = 1e-6; end
+        if ~exist('vdev_pf_enforce_q','var') || isempty(vdev_pf_enforce_q), vdev_pf_enforce_q = false; end
+
         [obj_vdev, vdev_kpi] = calc_voltage_deviation_acopf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_fallback_to_pf, vdev_p_eps, vdev_pf_enforce_q);
     else
-        [obj_vdev, vdev_kpi] = calc_voltage_deviation_acpf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_pf_enforce_q);
+        [obj_vdev, vdev_kpi] = calc_voltage_deviation_acpf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_pf_enforce_q, PD_NT);
     end
 end
 
@@ -1484,37 +1594,6 @@ if isfinite(cost_total), obj_econ = -cost_total; end
 if ~isnan(curtail_MWh), obj_curtail = -curtail_MWh; end
 obj_smooth = 0;
 
-% === 目标3：气网安全（最大化）===
-% 说明：
-%  - 有“越限/超载”时给很大的惩罚（硬惩罚）
-%  - 没有越限时也给一点“靠近上限”的软惩罚（可选，用于reward shaping）
-% gas_penalty = 0;
-% if isfield(gas_kpi,'valid') && gas_kpi.valid == 1
-%     % 硬惩罚权重（越限就重罚）
-%     Wp_cnt   = 1e4;   % 压力越限节点数
-%     Wp_amp   = 5e4;   % 压力越限幅度（pu）
-%     Wf_cnt   = 1e4;   % 管道超载条数
-%     Wf_amp   = 5e4;   % 超载幅度（loading-1）
-%
-%     % 软惩罚（可选：鼓励留裕度；不想要就把 Wmargin=0）
-%     Wmargin  = 200;
-%     margin_th = 0.85; % 例如希望 pipe_loading_max 尽量 < 0.85
-%
-%     pen_press = Wp_cnt*gas_kpi.press_violation_count + Wp_amp*gas_kpi.press_violation_max_pu;
-%     pen_pipe  = Wf_cnt*gas_kpi.pipe_overload_count  + Wf_amp*max(0, gas_kpi.pipe_loading_max - 1);
-%     pen_soft  = Wmargin*max(0, gas_kpi.pipe_loading_max - margin_th);
-%
-%     gas_penalty = pen_press + pen_pipe + pen_soft;
-% else
-%     % KPI 无效（例如求解失败/字段缺失）：直接重罚
-%     gas_penalty = 1e6;
-% end
-%
-% obj_gas_safe = -gas_penalty;
-%
-% % 把 penalty 存起来，方便你画图/调参/做消融
-% gas_kpi.gas_penalty = gas_penalty;
-
 %% === 目标3：气网安全（连续平滑版 reward shaping）===
 % 目标：保留 gas_kpi 的统计输出（count/ratio/max 等），但 reward 计算不再依赖 nnz/max/硬阈值。
 % 方法：
@@ -1624,7 +1703,8 @@ end
 obj_gas_safe = -gas_penalty;     % 仍然是“最大化安全”（最小化惩罚）
 gas_kpi.gas_penalty = gas_penalty;
 
-
+% obj_vdev 当前是“偏差值（越小越好）”
+obj_vdev = -obj_vdev;   % 变成“越大越好”
 % 8) 汇总输出结构
 out.obj   = [obj_econ, obj_curtail, obj_gas_safe, obj_vdev];
 
@@ -1635,7 +1715,7 @@ out.score = w(:)' * out.obj(:);
 
 out.cost_total     = cost_total;
 out.curtail_MWh    = curtail_MWh;
-out.curtail_MW     = curtail_MWh;
+out.curtail_MW     = curtail_MWh / T;
 out.eval_for_drl   = @(cap) iter_couple_most_mpng_24h_merged(cap, w_obj).score;
 out.comp_el_MW     = comp_el;
 out.most_ok        = ok_most;
@@ -1772,7 +1852,7 @@ try
         catch
             e2i = (1:size(Pg2,1))';
         end
-        pickE = @(ext_row) sum(Pg2(e2i(ext_row),:), 'all');
+        pickE = @(ext_row) sum(Pg2(e2i(ext_row),:), 'all') * dt;
 
         E_wind  = pickE(idx_wind);
         E_pv1   = pickE(idx_pv1);
@@ -2658,12 +2738,14 @@ else
 end
 end
 
-function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc_base, Pg_in, ID, T, vref, fail_pen)
+function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc_base, Pg_in, ID, T, vref, fail_pen, vdev_pf_enforce_q, PD_NT)
 % 计算 24h 电压偏差（AC PF）
 % - 输入 Pg_in 来自 MOST 的 ExpectedDispatch（可能是 internal 顺序）
 % - 自动映射到 external gen 行顺序；PF 失败时用 fail_pen 兜底，避免 NaN
 % - 默认用 RMS(Vm-1) 作为每小时电压偏差度量
 
+if nargin < 8, PD_NT = []; end
+if nargin < 7 || isempty(vdev_pf_enforce_q), vdev_pf_enforce_q = 0; end
 if nargin < 6 || isempty(fail_pen), fail_pen = 1.0; end
 if nargin < 5 || isempty(vref),     vref     = 1.0; end
 if nargin < 4 || isempty(T),        T        = size(Pg_in, 2); end
@@ -2679,8 +2761,71 @@ kpi.src          = "acpf:init";
 [idx_on_ext, Pg_on_ext, map_src] = map_Pg_to_ext_online_vdev(mpc_base, Pg_in, ID);
 kpi.src = "acpf:" + string(map_src);
 
+% ============================================================
+% 4.1 在 vdev 评估前的“输入清洗/对齐/限幅”（强烈推荐）
+% ============================================================
+
+% 4.1.1 空/坏维度直接兜底返回（否则后面很容易全 fail_pen）
+if isempty(idx_on_ext) || isempty(Pg_on_ext) || ndims(Pg_on_ext) ~= 2
+    kpi.failed_hours = T;
+    obj_vdev = fail_pen;
+    return;
+end
+
+% 4.1.2 T 与 Pg_on_ext 列数对齐（避免越界/后面全失败）
+T_eff = min(T, size(Pg_on_ext, 2));
+if T_eff ~= T
+    T = T_eff;
+    kpi.per_hour     = ones(T,1) * fail_pen;
+    kpi.failed_hours = 0;
+end
+
+% 4.1.3 只保留“确实在线”的机组索引（防止混入离线机组导致 PF 更易崩）
+% MATPOWER gen status 列是 8（常量），你也可以用 ID.GEN_STATUS（如果你有）
+GEN_STATUS_COL = 8;
+if size(mpc_base.gen,2) >= GEN_STATUS_COL
+    onmask_all = mpc_base.gen(:, GEN_STATUS_COL) > 0;
+    keep = onmask_all(idx_on_ext);
+    idx_on_ext = idx_on_ext(keep);
+    Pg_on_ext  = Pg_on_ext(keep, 1:T);
+else
+    Pg_on_ext  = Pg_on_ext(:, 1:T);
+end
+
+% 若过滤后没机组了：直接返回 fail_pen
+if isempty(idx_on_ext)
+    kpi.failed_hours = T;
+    obj_vdev = fail_pen;
+    return;
+end
+
+% 4.1.4 修复 Pg 中 NaN/Inf（否则 runpf 很容易炸）
+Pg_on_ext(~isfinite(Pg_on_ext)) = 0;
+
+% 4.1.5 Pg 限幅到 [PMIN, PMAX]（强烈建议；否则一超限就更容易不收敛）
+% MATPOWER gen: PMAX=9, PMIN=10（常量）；若你 ID 里有也可以用 ID.PMAX/ID.PMIN
+PMAX_COL = 9; PMIN_COL = 10;
+if size(mpc_base.gen,2) >= PMIN_COL
+    pmin = mpc_base.gen(idx_on_ext, PMIN_COL);
+else
+    pmin = -inf(numel(idx_on_ext),1);
+end
+if size(mpc_base.gen,2) >= PMAX_COL
+    pmax = mpc_base.gen(idx_on_ext, PMAX_COL);
+else
+    pmax = inf(numel(idx_on_ext),1);
+end
+
+% 兼容老 MATLAB：不用隐式扩展，手动扩展到 (ng_on x T)
+pminM = repmat(pmin, 1, T);
+pmaxM = repmat(pmax, 1, T);
+Pg_on_ext = min(max(Pg_on_ext(:,1:T), pminM), pmaxM);
+
+% ============================================================
+
 % --- 2) PF 选项（尽量安静 + 尽量稳定） ---
-mpopt_pf = mpoption('verbose', 0, 'out.all', 0, 'pf.enforce_q_lims', 0);
+mpopt_pf = mpoption('verbose', 0, 'out.all', 0, ...
+                    'pf.enforce_q_lims', double(logical(vdev_pf_enforce_q)));
 % MATPOWER 8+：优先用 legacy core，避免 mp-core 的 update_z 警告刷屏
 try
     mpopt_pf = mpoption(mpopt_pf, 'exp.use_legacy_core', 1);
@@ -2695,8 +2840,20 @@ VM_COL = ID.VM;        % bus(:, VM)
 BUS_TYPE_COL = 2;      % MATPOWER bus type 列固定是 2
 NONE = 4;              % isolated bus type
 
+% --- 3) PD_NT 合法性检查（不合法就当没传） ---
+use_PD_NT = ~isempty(PD_NT) && ismatrix(PD_NT) ...
+            && size(PD_NT,1) == size(mpc_base.bus,1) ...
+            && size(PD_NT,2) >= T;
+
 for tt = 1:T
     mpc_t = mpc_base;
+    
+    % ====== 4.1 的落地点：在 vdev PF 前写入每小时负荷口径 ======
+    if use_PD_NT
+        mpc_t.bus(:, ID.PD) = PD_NT(:, tt);
+        % 可选：如果你也有 QD_NT，建议同步写入 QD，潮流更一致
+        % mpc_t.bus(:, ID.QD) = QD_NT(:, tt);
+    end
 
     % 写入该小时有功出力（offline 机组保持 0）
     mpc_t.gen(:, ID.PG) = 0;
