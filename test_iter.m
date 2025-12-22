@@ -1,15 +1,34 @@
 clc; clear; close all;
 
-%% 3) 构造 cap 向量
-% 约定: cap = [WIND, PV1, PV2, (预留), GT上限, (预留)]
-% 这里先保留 PV2、GT 等为你原来习惯的值，有需要可再调。
+%% 3) 构造 cap 向量（12维版本）
+% cap = [
+%   (1) WIND_MW
+%   (2) PV1_MW
+%   (3) PV2_MW
+%   (4) EL_BOILER_or_HP_MW
+%   (5) GT_MW
+%   (6) STORAGE_Pmax_MW   （若你实现的是“总储能功率上限”）
+%   (7) mu_wind_bus
+%   (8) sigma_wind
+%   (9) mu_pv1_bus
+%  (10) sigma_pv1
+%  (11) mu_pv2_bus
+%  (12) sigma_pv2
+% ];
 Cap_wind_MW = 30;
 Cap_pv1_MW = 20;
 Cap_pv2_MW = 20;   % 仍然用原来的默认
+Cap_elboiler  = 50;   % 例如：电锅炉/热泵额定功率上限（MW）
 Cap_GT_MW  = 70;
-Cap_extra  = 70;
+Cap_sto_Pmax  = 20;   % 例如：总储能功率上限（MW）= wind电池10 + pv1电池10
 
-cap = [Cap_wind_MW, Cap_pv1_MW, Cap_pv2_MW, 1.0, Cap_GT_MW, Cap_extra];
+% soft-siting: 用“母线中心 + 软化宽度”
+mu_wind  = 13;  sigma_wind = 0.20;
+mu_pv1   = 18;  sigma_pv1  = 0.20;
+mu_pv2   = 25;  sigma_pv2  = 0.20;
+
+cap = [Cap_wind_MW; Cap_pv1_MW; Cap_pv2_MW; Cap_elboiler; Cap_GT_MW; Cap_sto_Pmax; ...
+       mu_wind; sigma_wind; mu_pv1; sigma_pv1; mu_pv2; sigma_pv2];
 
 %% 5) 多目标权重（经济 / 弃风光 / 平滑）
 w = [1, 1, 1, 1];
