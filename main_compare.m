@@ -1,24 +1,13 @@
 clc; clear; close all;
-%% -------- Global env config (shared by reset/step/evaluate) ----------
+%% ---------------- 0) 输入 ----------------
 global ENV
 ENV = struct();
 
 % --- action bounds (12D) ---
+% cap_min(4) 电锅炉/热泵额定功率上限（MW），并在构造el_boiler时加 min(el_boiler, cap_in(4))
+% cap_min(6) 储能功率或能量上限（MW/MWh），接入 MOST 的 storage 或可调负荷
 ENV.cap_min = [  5;  2;  2;   0;  20;   0;   1; 0.06;  1; 0.06;  1; 0.06];
 ENV.cap_max = [ 80; 60; 60; 300; 120; 300;   33; 0.85;  33; 0.85;  33; 0.85];
-
-% --- reward shaping / normalization refs ---
-ENV.norm = struct();
-ENV.norm.cost_ref    = 30;    % normalize avg_cost by this (tune)
-ENV.norm.curt_ref    = 1.0;   % curtail_ratio already [0,1]
-ENV.norm.gas_ref     = 1.0;  % normalize gas_risk by this (tune)
-ENV.norm.vdev_cap    = 0.20;  % voltage dev cap (pu)
-ENV.norm.dA_lambda   = 0.05;  % action-rate penalty weight (tune)
-
-% --- hard-fail behavior ---
-ENV.bad_reward = -1.0;        % only used on hard failures
-ENV.hard_fail_on_invalid_kpi = false; % if true, any NaN/Inf KPI => hard fail
-ENV.verbose_live = true;
 
 % --- compressor configuration (KEY REQUEST) ---
 ENV.comp_ids         = [5 7];
@@ -36,6 +25,18 @@ ENV.iter_opts.vdev.fallback_to_pf = true;
 % --- objective weights passed to iter_couple (if used there) ---
 ENV.w = [1 1 1 1];
 
+%% ---------------- 1) 归一化/奖励配置（按需可调） ----------------
+ENV.norm = struct();
+ENV.norm.cost_ref    = 30;    % normalize avg_cost by this (tune)
+ENV.norm.curt_ref    = 1.0;   % curtail_ratio already [0,1]
+ENV.norm.gas_ref     = 1.0;  % normalize gas_risk by this (tune)
+ENV.norm.vdev_cap    = 0.20;  % voltage dev cap (pu)
+ENV.norm.dA_lambda   = 0.05;  % action-rate penalty weight (tune)
+
+% --- hard-fail behavior ---
+ENV.bad_reward = -1.0;        % only used on hard failures
+ENV.hard_fail_on_invalid_kpi = false; % if true, any NaN/Inf KPI => hard fail
+ENV.verbose_live = true;
 % --- episode horizon ---
 ENV.MaxSteps = 5;
 
@@ -46,7 +47,7 @@ ENV.cap_min = lb;
 ENV.cap_max = ub;
 
 
-%% -------- RL environment specs ----------
+%% -------- 2) 构造 RL 环境 ----------
 obsDim = 4;
 actDim = numel(ENV.cap_min);
 
