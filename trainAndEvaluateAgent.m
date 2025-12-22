@@ -28,6 +28,7 @@ function [totalCost, out, objVals] = trainAndEvaluateAgent(algName, w_obj, lb, u
 
 %% Create RL environment wrapper
 % Determine the dimensionality of the action space from bounds
+obsDim = 4;
 actionDims = numel(lb);
 
 % Since the state vector returned by the environment is unknown at this
@@ -36,9 +37,9 @@ actionDims = numel(lb);
 % wrapper functions return actual observations.  The action space is
 % continuous and bounded in [-1,1] for each dimension; the bounds are
 % later used to scale actions into the capacity domain.
-obsInfo = rlNumericSpec([1 1]);
+obsInfo = rlNumericSpec([obsDim 1], "LowerLimit", zeros(obsDim,1), "UpperLimit", ones(obsDim,1));
 obsInfo.Name = 'State';
-actInfo = rlNumericSpec([actionDims 1], 'LowerLimit', -ones(actionDims,1), 'UpperLimit', ones(actionDims,1));
+actInfo = rlNumericSpec([actionDims 1], 'LowerLimit', lb, 'UpperLimit', ub);
 actInfo.Name = 'CapacityAction';
 
 % Instantiate the RL function environment with the wrapper functions
