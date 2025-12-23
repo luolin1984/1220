@@ -6,7 +6,7 @@ ENV = struct();
 % --- action bounds (12D) ---
 % cap_min(4) 电锅炉/热泵额定功率上限（MW），并在构造el_boiler时加 min(el_boiler, cap_in(4))
 % cap_min(6) 储能功率或能量上限（MW/MWh），接入 MOST 的 storage 或可调负荷
-ENV.cap_min = [  5;  2;  2;   0;  20;   0;   1; 0.06;  1; 0.06;  1; 0.06];
+ENV.cap_min = [  5;  2;  2;   1;  20;   1;   1; 0.06;  1; 0.06;  1; 0.06];
 ENV.cap_max = [ 80; 60; 60; 300; 120; 300;   33; 0.85;  33; 0.85;  33; 0.85];
 
 % --- compressor configuration (KEY REQUEST) ---
@@ -61,7 +61,7 @@ env = rlFunctionEnv(obsInfo, actInfo, "capStepFcn", "capResetFcn");
 
 %% ---------------- 3) 训练设置（四个算法统一口径） ----------------
 cfg = struct();
-cfg.MaxEpisodes   = 30;
+cfg.MaxEpisodes   = 10; % 30
 cfg.MaxSteps      = ENV.MaxSteps;
 cfg.EvalEpisodes  = 10;    % 训练后评估回合数
 cfg.Seed          = 1;
@@ -120,7 +120,12 @@ for i = 1:numel(names)
     agent = agents.(name);
 
     try
-        trainStats = train(agent, env, trainOpts);
+        [trainedAgent, trainStats] = train(agent, env, trainOpts);
+        
+        % ★关键：用训练后的 agent 覆盖回去，否则后面评估还是“未训练”★
+        agent = trainedAgent;
+        agents.(name) = agent;
+
         results.(name).trainStats = trainStats;
         results.(name).trainOK = true;
     catch ME
@@ -131,6 +136,7 @@ for i = 1:numel(names)
 
     fprintf('----------------- Evaluating %s -----------------\n', name);
     try
+        % ★关键：评估用训练后的 agent（上面 agent 已更新）★
         evalRes = evaluateAgentSimple(env, agent, cfg.EvalEpisodes, cfg.MaxSteps);
         results.(name).eval = evalRes;
         results.(name).evalOK = true;
@@ -153,3 +159,67 @@ for i = 1:numel(names)
         fprintf('%s | (no eval result)\n', name);
     end
 end
+
+%% ---------------- 7) 训练曲线对比（四算法叠加） ----------------
+try
+    figure('Name','Training Curves (4 RL Methods)','Color','w');
+    hold on; grid on;
+
+    for i = 1:numel(names)
+        name = names{i};
+        if ~isfield(results, name) || ~isfield(results.(name), 'trainStats') || isempty(results.(name).trainStats)
+            continue;
+        end
+
+        ts = results.(name).trainStats;
+        [ep, r, rAvg] = local_extract_reward(ts);
+
+        if isempty(ep) || isempty(r), continue; end
+
+        plot(ep, r, 'DisplayName', sprintf('%s: EpisodeReward', name));
+        if ~isempty(rAvg)
+            plot(ep, rAvg, '--', 'DisplayName', sprintf('%s: AverageReward', name));
+        end
+    end
+
+    xlabel('Episode');
+    ylabel('Reward');
+    title('Training Curves Comparison');
+    legend('Location','best');
+catch ME
+    warning('[plot] training curves failed: %s', ME.message);
+end
+
+%% ---------- local helper: robust reward extraction ----------
+function [ep, r, rAvg] = local_extract_reward(ts)
+    ep = []; r = []; rAvg = [];
+
+    % table
+    if istable(ts)
+        vn = ts.Properties.VariableNames;
+        if any(strcmp(vn,'EpisodeIndex')),  ep   = ts.EpisodeIndex;  end
+        if any(strcmp(vn,'EpisodeReward')), r    = ts.EpisodeReward; end
+        if any(strcmp(vn,'AverageReward')), rAvg = ts.AverageReward; end
+        if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
+        return;
+    end
+
+    % struct
+    if isstruct(ts)
+        if isfield(ts,'EpisodeIndex'),  ep   = ts.EpisodeIndex;  end
+        if isfield(ts,'EpisodeReward'), r    = ts.EpisodeReward; end
+        if isfield(ts,'AverageReward'), rAvg = ts.AverageReward; end
+        if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
+        return;
+    end
+
+    % object (just in case)
+    try
+        if isprop(ts,'EpisodeIndex'),  ep   = ts.EpisodeIndex;  end
+        if isprop(ts,'EpisodeReward'), r    = ts.EpisodeReward; end
+        if isprop(ts,'AverageReward'), rAvg = ts.AverageReward; end
+        if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
+    catch
+    end
+end
+
