@@ -23,7 +23,16 @@ try
 
     % clip action
     info.stage = "clip_action";
-    a = double(action(:));
+    
+    % a = double(action(:));
+
+    % --- robust action parsing (cell/dlarray/gpuArray -> double column) ---
+    a  = action;
+    pa = prevAction;
+
+    a  = local_to_double_col(a);
+    pa = local_to_double_col(pa);
+
     a = min(max(a, cap_min), cap_max);
     info.action_clip = a;
 
@@ -31,7 +40,7 @@ try
     info.stage = "compute_dA";
     denom = (cap_max - cap_min);
     denom(denom <= 0) = 1;
-    info.dA = mean(abs(a - double(prevAction(:))) ./ denom);
+    info.dA = mean(abs(a - pa) ./ denom);
 
     % forward compressor options into iter opts
     info.stage = "prepare_iter_opts";
@@ -181,4 +190,22 @@ if isstruct(s) && isfield(s, f)
 else
     v = d;
 end
+end
+
+function x = local_to_double_col(x)
+    if isa(x, 'dlarray')
+        x = extractdata(x);
+    end
+    if isa(x, 'gpuArray')
+        x = gather(x);
+    end
+    if iscell(x)
+        if numel(x) == 1
+            x = x{1};
+        else
+            % 既兼容 {scalar,scalar,...} 也兼容 {vector}
+            x = cell2mat(x(:));
+        end
+    end
+    x = double(x(:));
 end
