@@ -11,7 +11,7 @@ ENV.cap_max = [ 80; 60; 60; 300; 120; 300;   33; 0.85;  33; 0.85;  33; 0.85];
 
 % --- compressor configuration (KEY REQUEST) ---
 ENV.comp_ids         = [5 7];
-ENV.force_comp_as_el = false;
+ENV.force_comp_as_el = true;
 
 % --- iter_couple options (forwarded) ---
 ENV.iter_opts = struct();
