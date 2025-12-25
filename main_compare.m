@@ -6,10 +6,10 @@ ENV = struct();
 % --- action bounds (12D) ---
 % cap_min(4) 电锅炉/热泵额定功率上限（MW），并在构造el_boiler时加 min(el_boiler, cap_in(4))
 % cap_min(6) 储能功率或能量上限（MW/MWh），接入 MOST 的 storage 或可调负荷
-ENV.cap_min = [  5;  2;  2;   1;  20;   1;   1; 0.06;  1; 0.06;  1; 0.06];
-ENV.cap_max = [ 80; 60; 60; 300; 120; 300;   33; 0.85;  33; 0.85;  33; 0.85];
+ENV.cap_min = [  5;  2;  2;   1;  20;   1;   1;    1;    1];
+ENV.cap_max = [ 80; 60; 60; 300; 120; 300;   33;   33;   33];
 
-% --- compressor configuration (KEY REQUEST) ---
+% --- compressor configuration ---
 ENV.comp_ids         = [5 7];
 ENV.force_comp_as_el = true;
 
@@ -40,14 +40,7 @@ ENV.verbose_live = true;
 % --- episode horizon ---
 ENV.MaxSteps = 5;
 
-
-lb = [ENV.cap_min(1:6); 1; 1; 1];
-ub = [ENV.cap_max(1:6); 33; 33; 33];
-ENV.cap_min = lb;
-ENV.cap_max = ub;
-
-
-%% -------- 2) 构造 RL 环境 ----------
+%% ---------------- 2) 构造 RL 环境 ----------
 obsDim = 4;
 actDim = numel(ENV.cap_min);
 
@@ -84,7 +77,7 @@ agents = struct();
 [actorDDPG, criticDDPG] = buildDDPGNetworks(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
 ddpgOpts = rlDDPGAgentOptions(SampleTime=1, DiscountFactor=0.99, TargetSmoothFactor=1e-3, ...
     ExperienceBufferLength=1e6, MiniBatchSize=256);
-ddpgOpts.NoiseOptions.Variance = 0.15;        % exploration noise
+ddpgOpts.NoiseOptions.Variance = 0.15;
 ddpgOpts.NoiseOptions.VarianceDecayRate = 1e-5;
 agents.DDPG = rlDDPGAgent(actorDDPG, criticDDPG, ddpgOpts);
 
@@ -92,7 +85,6 @@ agents.DDPG = rlDDPGAgent(actorDDPG, criticDDPG, ddpgOpts);
 [actorTD3, critic1TD3, critic2TD3] = buildTD3Networks(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
 td3Opts = rlTD3AgentOptions(SampleTime=1, DiscountFactor=0.99, TargetSmoothFactor=5e-3, ...
     ExperienceBufferLength=1e6, MiniBatchSize=256);
-% TD3 exploration + target-policy smoothing noise
 td3Opts.ExplorationModel.Variance = 0.15;
 td3Opts.ExplorationModel.VarianceDecayRate = 1e-5;
 td3Opts.TargetPolicySmoothModel.Variance = 0.20;
@@ -100,18 +92,17 @@ td3Opts.TargetPolicySmoothModel.LowerLimit = -0.5;
 td3Opts.TargetPolicySmoothModel.UpperLimit = 0.5;
 agents.TD3 = rlTD3Agent(actorTD3, [critic1TD3 critic2TD3], td3Opts);
 
-% --- PPO (continuous Gaussian policy) ---
+% PPO / A2C
 agents.PPO = buildPPOAgent(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
-
-% --- A2C (用 AC agent + continuous Gaussian policy) ---
 agents.A2C = buildA2CAgent(obsInfo, actInfo, ENV.cap_min, ENV.cap_max);
 
 %% ---------------- 5) 依次训练 + 评估 ----------------
 names = {"DDPG","TD3","PPO","A2C"};
+
 results = struct();
 results.cfg = cfg;
-results.lb = lb;
-results.ub = ub;
+results.lb  = ENV.cap_min;     % 修复：原来 lb/ub 未定义
+results.ub  = ENV.cap_max;
 results.summary = struct();
 
 for i = 1:numel(names)
@@ -119,24 +110,30 @@ for i = 1:numel(names)
     fprintf('\n================= Training %s =================\n', name);
     agent = agents.(name);
 
-    try
-        [trainedAgent, trainStats] = train(agent, env, trainOpts);
-        
-        % ★关键：用训练后的 agent 覆盖回去，否则后面评估还是“未训练”★
-        agent = trainedAgent;
-        agents.(name) = agent;
+    % ✅ 关键：用 safe_train 兼容不同 MATLAB 版本 train 输出形式
+    [trainedAgent, trainStats, trainErr] = safe_train(agent, env, trainOpts);
 
+    if isempty(trainErr)
+        agent = trainedAgent;          % 对“2输出版本”是新的 agent
+        agents.(name) = agent;         % 对“1输出版本”agent 通常已在原地更新，这句也安全
         results.(name).trainStats = trainStats;
         results.(name).trainOK = true;
-    catch ME
-        warning('Training %s failed: %s', name, ME.message);
+
+        % 额外：打印一下曲线点数，确保不是空
+        try
+            [ep_dbg, r_dbg] = local_extract_reward(trainStats);
+            fprintf('[%s] trainStats episodes=%d\n', name, numel(r_dbg));
+        catch
+        end
+    else
+        warning('Training %s failed:\n%s', name, getReport(trainErr,'extended','hyperlinks','off'));
         results.(name).trainStats = [];
         results.(name).trainOK = false;
+        results.(name).trainErr = trainErr;
     end
 
     fprintf('----------------- Evaluating %s -----------------\n', name);
     try
-        % ★关键：评估用训练后的 agent（上面 agent 已更新）★
         evalRes = evaluateAgentSimple(env, agent, cfg.EvalEpisodes, cfg.MaxSteps);
         results.(name).eval = evalRes;
         results.(name).evalOK = true;
@@ -165,6 +162,8 @@ try
     figure('Name','Training Curves (4 RL Methods)','Color','w');
     hold on; grid on;
 
+    anyPlotted = false;
+
     for i = 1:numel(names)
         name = names{i};
         if ~isfield(results, name) || ~isfield(results.(name), 'trainStats') || isempty(results.(name).trainStats)
@@ -177,6 +176,7 @@ try
         if isempty(ep) || isempty(r), continue; end
 
         plot(ep, r, 'DisplayName', sprintf('%s: EpisodeReward', name));
+        anyPlotted = true;
         if ~isempty(rAvg)
             plot(ep, rAvg, '--', 'DisplayName', sprintf('%s: AverageReward', name));
         end
@@ -185,41 +185,79 @@ try
     xlabel('Episode');
     ylabel('Reward');
     title('Training Curves Comparison');
-    legend('Location','best');
+
+    if anyPlotted
+        legend('Location','best');
+    else
+        title('Training Curves Comparison (NO DATA PLOTTED)');
+        text(0.05,0.9,'No trainStats available. Check results.(agent).trainErr', 'Units','normalized');
+    end
 catch ME
     warning('[plot] training curves failed: %s', ME.message);
 end
 
 %% ---------- local helper: robust reward extraction ----------
 function [ep, r, rAvg] = local_extract_reward(ts)
-    ep = []; r = []; rAvg = [];
+ep = []; r = []; rAvg = [];
 
-    % table
-    if istable(ts)
-        vn = ts.Properties.VariableNames;
-        if any(strcmp(vn,'EpisodeIndex')),  ep   = ts.EpisodeIndex;  end
-        if any(strcmp(vn,'EpisodeReward')), r    = ts.EpisodeReward; end
-        if any(strcmp(vn,'AverageReward')), rAvg = ts.AverageReward; end
-        if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
-        return;
-    end
-
-    % struct
-    if isstruct(ts)
-        if isfield(ts,'EpisodeIndex'),  ep   = ts.EpisodeIndex;  end
-        if isfield(ts,'EpisodeReward'), r    = ts.EpisodeReward; end
-        if isfield(ts,'AverageReward'), rAvg = ts.AverageReward; end
-        if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
-        return;
-    end
-
-    % object (just in case)
-    try
-        if isprop(ts,'EpisodeIndex'),  ep   = ts.EpisodeIndex;  end
-        if isprop(ts,'EpisodeReward'), r    = ts.EpisodeReward; end
-        if isprop(ts,'AverageReward'), rAvg = ts.AverageReward; end
-        if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
-    catch
-    end
+% table
+if istable(ts)
+    vn = ts.Properties.VariableNames;
+    if any(strcmp(vn,'EpisodeIndex')),  ep   = ts.EpisodeIndex;  end
+    if any(strcmp(vn,'EpisodeReward')), r    = ts.EpisodeReward; end
+    if any(strcmp(vn,'AverageReward')), rAvg = ts.AverageReward; end
+    if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
+    return;
 end
 
+% struct
+if isstruct(ts)
+    if isfield(ts,'EpisodeIndex'),  ep   = ts.EpisodeIndex;  end
+    if isfield(ts,'EpisodeReward'), r    = ts.EpisodeReward; end
+    if isfield(ts,'AverageReward'), rAvg = ts.AverageReward; end
+    if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
+    return;
+end
+
+% object (just in case)
+try
+    if isprop(ts,'EpisodeIndex'),  ep   = ts.EpisodeIndex;  end
+    if isprop(ts,'EpisodeReward'), r    = ts.EpisodeReward; end
+    if isprop(ts,'AverageReward'), rAvg = ts.AverageReward; end
+    if isempty(ep) && ~isempty(r), ep = (1:numel(r)).'; end
+catch
+end
+end
+
+
+function [agentOut, stats, trainErr] = safe_train(agentIn, env, trainOpts)
+%SAFE_TRAIN 兼容不同 MATLAB RL Toolbox 版本的 train 输出形式
+% - 有些版本: [agentOut, stats] = train(...)
+% - 有些版本: stats = train(...), agent 在原地更新
+
+trainErr = [];
+stats    = [];
+agentOut = agentIn;
+
+try
+    % 先尝试“2输出”写法（若你的版本支持，这是最理想的）
+    [agentOut, stats] = train(agentIn, env, trainOpts);
+    return;
+catch ME
+    if strcmp(ME.identifier, "MATLAB:TooManyOutputs")
+        % 回退到“1输出”写法
+        try
+            stats    = train(agentIn, env, trainOpts);
+            agentOut = agentIn;  % 训练后 agentIn 通常已被更新（句柄对象）
+            trainErr = [];
+            return;
+        catch ME2
+            trainErr = ME2;
+            return;
+        end
+    else
+        trainErr = ME;
+        return;
+    end
+end
+end
