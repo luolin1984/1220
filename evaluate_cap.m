@@ -23,15 +23,34 @@ try
 
     % clip action
     info.stage = "clip_action";
-    
-    % a = double(action(:));
 
-    % --- robust action parsing (cell/dlarray/gpuArray -> double column) ---
-    a  = action;
-    pa = prevAction;
+    a  = local_to_col_double(action);
+    pa = local_to_col_double(prevAction);
 
-    a  = local_to_double_col(a);
-    pa = local_to_double_col(pa);
+    % 维度兜底：避免 size mismatch 导致 min/max 抛错
+    n = numel(cap_min);
+    if numel(a) ~= n
+        if isscalar(a)
+            a = repmat(a, n, 1);
+        else
+            a = a(:);
+            a = a(1:min(end,n));
+            if numel(a) < n
+                a(end+1:n,1) = cap_min(numel(a)+1:n);
+            end
+        end
+    end
+    if numel(pa) ~= n
+        if isscalar(pa)
+            pa = repmat(pa, n, 1);
+        else
+            pa = pa(:);
+            pa = pa(1:min(end,n));
+            if numel(pa) < n
+                pa(end+1:n,1) = cap_min(numel(pa)+1:n);
+            end
+        end
+    end
 
     a = min(max(a, cap_min), cap_max);
     info.action_clip = a;
@@ -192,20 +211,26 @@ else
 end
 end
 
-function x = local_to_double_col(x)
-    if isa(x, 'dlarray')
-        x = extractdata(x);
+function v = local_to_col_double(x)
+% Robustly convert action/prevAction to numeric column vector
+
+% unwrap nested single-cell chains: {{...}} -> ...
+while iscell(x) && numel(x)==1
+    x = x{1};
+end
+
+% if it's a cell array (often 1xN cell of scalars), convert to numeric
+if iscell(x)
+    try
+        x = cell2mat(x(:));
+    catch
+        % fallback: handle scalar cells
+        x = cellfun(@(z) double(z), x(:));
     end
-    if isa(x, 'gpuArray')
-        x = gather(x);
-    end
-    if iscell(x)
-        if numel(x) == 1
-            x = x{1};
-        else
-            % 既兼容 {scalar,scalar,...} 也兼容 {vector}
-            x = cell2mat(x(:));
-        end
-    end
-    x = double(x(:));
+end
+
+if isa(x,'dlarray'),  x = extractdata(x); end
+if isa(x,'gpuArray'), x = gather(x);      end
+
+v = double(x(:));
 end
