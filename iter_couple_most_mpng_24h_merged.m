@@ -998,6 +998,7 @@ if ok_most && ~isempty(comp_el)
     if size(comp_el,2) ~= T
         warning('[COUPLED] comp_el 尺寸为 %dx%d，不是 ncomp×T（T=%d），跳过强耦合迭代。', ...
             size(comp_el,1), size(comp_el,2), T);
+        return;
     end
         NB = size(mpc.bus, 1);
 
