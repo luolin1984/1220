@@ -156,7 +156,7 @@ mpc.gencost(idx_gas, :)   = pad_gencost_linear(mpc.gencost, 45);
 % 高价兜底机
 [mpc, idx_slack] = safe_add_gen(mpc, 1, 500.0, 10.0, 1.00, 'thermal', ID);
 mpc.gencost(idx_slack, :) = pad_gencost_linear(mpc.gencost, 2000);
-mpc.gen(idx_slack, ID.PMAX) = 1.0;
+% mpc.gen(idx_slack, ID.PMAX) = 1.0;
 mpc.gencost(idx_slack, :)   = pad_gencost_linear(mpc.gencost, 2000);
 
 % ===== 新增：主网机组（case33bw 原有的第 1 行）视为 GRID，调整成本和容量 =====
@@ -998,55 +998,55 @@ if ok_most && ~isempty(comp_el)
     if size(comp_el,2) ~= T
         warning('[COUPLED] comp_el 尺寸为 %dx%d，不是 ncomp×T（T=%d），跳过强耦合迭代。', ...
             size(comp_el,1), size(comp_el,2), T);
-        return;
+        comp_el = []; 
     end
-        NB = size(mpc.bus, 1);
+    NB = size(mpc.bus, 1);
 
-        % 每个母线每小时的压缩机附加负荷：NB×T
-        add_load_NT = zeros(NB, T);
+    % 每个母线每小时的压缩机附加负荷：NB×T
+    add_load_NT = zeros(NB, T);
 
-        try
-            if isfield(connect,'interc') && isfield(connect.interc,'comp') && ~isempty(connect.interc.comp)
-                map  = connect.interc.comp;   % [COMP_ID, BUS_ID]
-                nmap = size(map, 1);
+    try
+        if isfield(connect,'interc') && isfield(connect.interc,'comp') && ~isempty(connect.interc.comp)
+            map  = connect.interc.comp;   % [COMP_ID, BUS_ID]
+            nmap = size(map, 1);
 
-                % BUS号所在列：MATPOWER bus(:,1) 即 BUS_I
-                col_bus = 1;
-                if exist('ID','var') && isstruct(ID) && isfield(ID,'BUS_I')
-                    col_bus = ID.BUS_I; %#ok<NASGU> % 你ID里目前没存BUS_I，这行留着也无伤
-                end
-
-                for kk = 1:nmap
-                    cid = map(kk,1);    % 压缩机行号（mgc.comp 的行）
-                    bid = map(kk,2);    % 电网母线号（BUS_I）
-
-                    if cid < 1 || cid > size(comp_el,1), continue; end
-
-                    bus_row = find(mpc.bus(:,1) == bid, 1);  % 用 bus(:,BUS_I)
-                    if isempty(bus_row), continue; end
-
-                    % ★正确的累加：写回 add_load_NT 的一整行(1×T)
-                    add_load_NT(bus_row, :) = add_load_NT(bus_row, :) + comp_el(cid, :);
-                end
+            % BUS号所在列：MATPOWER bus(:,1) 即 BUS_I
+            col_bus = 1;
+            if exist('ID','var') && isstruct(ID) && isfield(ID,'BUS_I')
+                col_bus = ID.BUS_I; %#ok<NASGU> % 你ID里目前没存BUS_I，这行留着也无伤
             end
-        catch ME_map
-            warning('[COUPLED] 压缩机负荷-母线映射失败：%s，跳过强耦合迭代。', ME_map.message);
-            add_load_NT(:,:) = 0;
-        end
-        % 用 add_load_NT 判断是否有压缩机负荷
-        if any(add_load_NT(:) > 1e-6)
-            Psum_hour = sum(add_load_NT, 1);     % 1×T
-            dt_c = 1;
-            try, if exist('mdE','var') && isfield(mdE,'Delta_T') && ~isempty(mdE.Delta_T), dt_c = mdE.Delta_T; end, catch, end
-            Esum_MWh = sum(Psum_hour) * dt_c;
 
-            fprintf('[COUPLED] 压缩机负荷反馈：P[min/avg/max]=%.3f/%.3f/%.3f MW, E=%.3f MWh\n', ...
-                min(Psum_hour), mean(Psum_hour), max(Psum_hour), Esum_MWh);
+            for kk = 1:nmap
+                cid = map(kk,1);    % 压缩机行号（mgc.comp 的行）
+                bid = map(kk,2);    % 电网母线号（BUS_I）
 
-            % profiles2 构造保持你原来的写法即可（rows_comp/vals_comp 那段没问题）
-        else
-            fprintf('[COUPLED] 压缩机电耗为零或未识别，跳过强耦合迭代。\n');
+                if cid < 1 || cid > size(comp_el,1), continue; end
+
+                bus_row = find(mpc.bus(:,1) == bid, 1);  % 用 bus(:,BUS_I)
+                if isempty(bus_row), continue; end
+
+                % ★正确的累加：写回 add_load_NT 的一整行(1×T)
+                add_load_NT(bus_row, :) = add_load_NT(bus_row, :) + comp_el(cid, :);
+            end
         end
+    catch ME_map
+        warning('[COUPLED] 压缩机负荷-母线映射失败：%s，跳过强耦合迭代。', ME_map.message);
+        add_load_NT(:,:) = 0;
+    end
+    % 用 add_load_NT 判断是否有压缩机负荷
+    if any(add_load_NT(:) > 1e-6)
+        Psum_hour = sum(add_load_NT, 1);     % 1×T
+        dt_c = 1;
+        try, if exist('mdE','var') && isfield(mdE,'Delta_T') && ~isempty(mdE.Delta_T), dt_c = mdE.Delta_T; end, catch, end
+        Esum_MWh = sum(Psum_hour) * dt_c;
+
+        fprintf('[COUPLED] 压缩机负荷反馈：P[min/avg/max]=%.3f/%.3f/%.3f MW, E=%.3f MWh\n', ...
+            min(Psum_hour), mean(Psum_hour), max(Psum_hour), Esum_MWh);
+
+        % profiles2 构造保持你原来的写法即可（rows_comp/vals_comp 那段没问题）
+    else
+        fprintf('[COUPLED] 压缩机电耗为零或未识别，跳过强耦合迭代。\n');
+    end
 
     if any(add_load_NT > 1e-6)
         fprintf('[COUPLED] 将压缩机电耗作为固定负荷反馈到 MOST，总功率 = %.3f MW\n', sum(add_load_NT));
@@ -1332,12 +1332,10 @@ end
 
 % ===== 构造每小时母线负荷 PD_NT（NB×T），与 MOST profiles 口径尽量一致 =====
 NB = size(mpc_used.bus, 1);
-PD_NT = repmat(mpc_used.bus(:,ID.PD), 1, T);
-
+PD0_ref = mpc_used.bus(:,ID.PD);
 % 基准负荷的早晚高/中午低增量（与你 vals_bus2 一致：用“原始Pd_bus0”）
-PD0_all = mpc.bus(:,ID.PD);     % 这里用最初的 mpc（未缩放那份）
 for tt = 1:T
-    PD_NT(:,tt) = PD_NT(:,tt) + (scale(tt) - 1.0) * PD0_all;
+    PD_NT(:,tt) = PD0_ref * scale(tt);  % 等价于 PD0_ref + (scale-1)*PD0_ref
 end
 
 % 电锅炉分摊到各负荷母线
@@ -1370,15 +1368,56 @@ if ~used_mpng_v
         if ~exist('vdev_p_eps','var') || isempty(vdev_p_eps), vdev_p_eps = 1e-6; end
         if ~exist('vdev_pf_enforce_q','var') || isempty(vdev_pf_enforce_q), vdev_pf_enforce_q = false; end
 
-        [obj_vdev, vdev_kpi] = calc_voltage_deviation_acopf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_fallback_to_pf, vdev_p_eps, vdev_pf_enforce_q);
+        [obj_vdev, vdev_kpi] = calc_voltage_deviation_acopf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_fallback_to_pf, vdev_p_eps, vdev_pf_enforce_q, PD_NT);
     else
         [obj_vdev, vdev_kpi] = calc_voltage_deviation_acpf(mpc_used, Pg2, ID, T, vref, vdev_fail_pen, vdev_pf_enforce_q, PD_NT);
     end
 end
 
+% ===== [NEW] 用 CVaR(α) 做“实打实”的风险度量，并补齐 voltage_dev_series_pu =====
+alpha_cvar = 0.95;   % 默认 CVaR 置信水平：95%
+if isfield(opts,'vdev') && isstruct(opts.vdev)
+    if isfield(opts.vdev,'cvar_alpha') && isfinite(opts.vdev.cvar_alpha)
+        alpha_cvar = opts.vdev.cvar_alpha;
+    end
+end
 
-% 存入 kpis
-out.kpis.voltage_dev = vdev_kpi;   % 结构体：avg/max/failed_hours 等
+% 兜底：确保 vdev_kpi.series 一定存在且是 1×T
+if ~exist('vdev_kpi','var') || ~isstruct(vdev_kpi), vdev_kpi = struct(); end
+if ~isfield(vdev_kpi,'series') || isempty(vdev_kpi.series)
+    % 若 calc_voltage_deviation_* 还没返回 series，就先用 obj_vdev 填成常数序列兜底
+    vdev_kpi.series = repmat(double(obj_vdev), 1, T);
+else
+    s = double(vdev_kpi.series(:)).';
+    if numel(s) ~= T
+        % 尺寸不对就裁剪/补齐（宁可不中断训练）
+        s2 = repmat(s(1), 1, T);
+        s2(1:min(T,numel(s))) = s(1:min(T,numel(s)));
+        vdev_kpi.series = s2;
+    else
+        vdev_kpi.series = s;
+    end
+end
+
+% 计算 VaR / CVaR（对“偏差”这种 loss，用上尾：越大越糟）
+[vdev_var_pu, vdev_cvar_pu, tail_hours] = local_cvar(vdev_kpi.series, alpha_cvar);
+
+vdev_kpi.alpha      = alpha_cvar;
+vdev_kpi.var_pu     = vdev_var_pu;
+vdev_kpi.cvar_pu    = vdev_cvar_pu;
+vdev_kpi.tail_hours = tail_hours;   % 触发尾部的小时索引（1..T）
+
+% ★关键：用 CVaR 替换原 obj_vdev（此时仍是“越小越好”的 raw 偏差量）
+obj_vdev = vdev_cvar_pu;
+
+% 同时保留 avg/max 这类老口径（如果 calc_* 已经给了就不动；没有就从 series 算）
+if ~isfield(vdev_kpi,'avg') || ~isfinite(vdev_kpi.avg)
+    vdev_kpi.avg = mean(vdev_kpi.series, 'omitnan');
+end
+if ~isfield(vdev_kpi,'max') || ~isfinite(vdev_kpi.max)
+    vdev_kpi.max = max(vdev_kpi.series);
+end
+
 
 %% 6.x) 气网安全性指标：节点压力 + 管道负载率
 gas_kpi = struct();
@@ -1717,7 +1756,7 @@ out.score = w(:)' * out.obj(:);
 out.cost_total     = cost_total;
 out.curtail_MWh    = curtail_MWh;
 out.curtail_MW     = curtail_MWh / T;
-out.eval_for_drl   = @(cap) iter_couple_most_mpng_24h_merged(cap, w_obj).score;
+out.eval_for_drl   = @(cap) iter_couple_most_mpng_24h_merged(cap, w_obj, opts).score;
 out.comp_el_MW     = comp_el;
 out.most_ok        = ok_most;
 
@@ -1784,7 +1823,15 @@ if exist('vdev_kpi','var') && ~isempty(vdev_kpi) && isstruct(vdev_kpi)
     if isfield(vdev_kpi,'max'),          out.kpis.voltage_dev_max_pu = vdev_kpi.max; end
     if isfield(vdev_kpi,'failed_hours'), out.kpis.voltage_dev_failed_hours = vdev_kpi.failed_hours; end
     if isfield(vdev_kpi,'src'),          out.kpis.voltage_dev_src = string(vdev_kpi.src); end
+    % === [NEW] 明确输出逐小时电压偏差序列 + CVaR 风险指标 ===
+    if isfield(vdev_kpi,'series') && ~isempty(vdev_kpi.series)
+        out.kpis.voltage_dev_series_pu = double(vdev_kpi.series(:)).';     % 1×T
+    end
+    if isfield(vdev_kpi,'alpha'),   out.kpis.voltage_dev_cvar_alpha = double(vdev_kpi.alpha); end
+    if isfield(vdev_kpi,'var_pu'),  out.kpis.voltage_dev_var_pu     = double(vdev_kpi.var_pu); end
+    if isfield(vdev_kpi,'cvar_pu'), out.kpis.voltage_dev_cvar_pu    = double(vdev_kpi.cvar_pu); end
 end
+
 % 储能功率 & SOC & 绝对能量
 out.Pg_storage_wind   = [];
 out.Pg_storage_pv1    = [];
@@ -1925,6 +1972,11 @@ out.vis.E_slack   = E_slack;
 out.vis.E_other   = E_other;
 out.vis.P_served  = P_served;
 out.vis.P_nonserved = P_nonserved;
+
+out.vis.voltage_dev_series_pu = out.kpis.voltage_dev_series_pu;
+out.vis.voltage_dev_cvar_pu   = out.kpis.voltage_dev_cvar_pu;
+out.vis.voltage_dev_var_pu    = out.kpis.voltage_dev_var_pu;
+out.vis.voltage_dev_alpha     = out.kpis.voltage_dev_cvar_alpha;
 
 
 end % ===== 主函数结束 =====
@@ -2622,476 +2674,317 @@ if ~isfinite(m) || ~isreal(m), m = vmax; end
 end
 
 function [obj_vdev, kpi] = calc_voltage_deviation_from_mpng(eg, ID, T, vref, fail_pen, nb_base)
-% 直接从 MPNG 的 AC-OPF 结果中提取 Vm 并计算电压偏差（优先路径）
-% 兼容两类返回：
-%   1) eg.mpc.bus 为 “nb_base*T” 行（多时段扩展堆叠）
-%   2) eg.mpc.bus 仅 “nb_base” 行（单时段快照/最后一时段）
-% 若无法识别形状，则标记 used=false，交由上层回退到 acopf/acpf。
+% 从 MPNG 的 AC-OPF 结果直接读取 Vm 并计算电压偏差（优先路径）
+% 支持两种形状：
+%   - eg.mpc.bus 行数 = nb_base*T （按小时堆叠）
+%   - eg.mpc.bus 行数 = nb_base   （单时段快照）
+%
+% 输出：
+%   obj_vdev = 24h 平均 |Vm-vref|（越小越好）
+%   kpi      = 结构体（avg/max/failed_hours/src/per_hour/used/note）
 
-if nargin < 5 || isempty(fail_pen), fail_pen = 0.2; end
-if nargin < 4 || isempty(vref),     vref     = 1.0; end
-if nargin < 3 || isempty(T),        T        = 24;  end
-if nargin < 6 || isempty(nb_base),  nb_base  = [];  end
+if nargin < 6 || isempty(nb_base), nb_base = []; end
+if nargin < 5 || isempty(fail_pen), fail_pen = 0.20; end
+if nargin < 4 || isempty(vref),     vref     = 1.0;  end
+if nargin < 3 || isempty(T),        T        = 24;   end
 
-kpi = struct();
-kpi.used         = false;
-kpi.per_hour     = ones(T,1) * fail_pen;
-kpi.failed_hours = T;
-kpi.avg          = fail_pen;
-kpi.max          = fail_pen;
-kpi.src          = "mpng:init";
+kpi = struct('used',false,'src','mpng','avg',fail_pen,'max',fail_pen, ...
+    'failed_hours',T,'per_hour',fail_pen*ones(1,T),'note','');
 
-if isempty(eg) || ~isstruct(eg) || ~isfield(eg,'mpc') || ~isstruct(eg.mpc) || ~isfield(eg.mpc,'bus')
-    kpi.src = "mpng:no_mpc";
-    obj_vdev = kpi.avg; return;
-end
+obj_vdev = fail_pen;
 
-bus = eg.mpc.bus;
-if isempty(bus) || size(bus,2) < ID.VM
-    kpi.src = "mpng:no_vm_col";
-    obj_vdev = kpi.avg; return;
-end
+try
+    % 找到 MATPOWER 结果容器
+    mpc_m = [];
+    if isfield(eg,'mpc') && isstruct(eg.mpc), mpc_m = eg.mpc; end
+    if isempty(mpc_m) && isfield(eg,'matpower') && isstruct(eg.matpower), mpc_m = eg.matpower; end
+    if isempty(mpc_m), return; end
+    if ~isfield(mpc_m,'bus') || isempty(mpc_m.bus), return; end
 
-Vm_all = bus(:, ID.VM);
-Vm_all = Vm_all(:);
-nb_total = size(bus,1);
+    B = mpc_m.bus;
+    nb = size(B,1);
 
-if isempty(nb_base)
-    nb_base = nb_total;  % 兜底：按单时段处理
-end
-
-H = []; nb_per = [];
-mode = "";
-
-% (A) 标准：nb_total == nb_base*T
-if nb_total == nb_base * T
-    H = T; nb_per = nb_base; mode = "stack_nbxt";
-    % (B) 单时段快照：nb_total == nb_base
-elseif nb_total == nb_base
-    H = 1; nb_per = nb_base; mode = "single_snapshot";
-    % (C) 可推断：nb_total 可被 nb_base 整除（但时段数不等于 T）
-elseif mod(nb_total, nb_base) == 0
-    H = nb_total / nb_base; nb_per = nb_base; mode = "infer_H_from_nb";
-    % (D) 另一种可推断：nb_total 可被 T 整除（但 nb_base 不可信）
-elseif mod(nb_total, T) == 0
-    H = T; nb_per = nb_total / T; mode = "infer_nb_from_T";
-else
-    kpi.src = "mpng:shape_unrecognized";
-    obj_vdev = kpi.avg; return;
-end
-
-if H == 1
-    mask = isfinite(Vm_all);
-    if ~any(mask)
-        kpi.src = "mpng:single_all_nan";
-        obj_vdev = kpi.avg; return;
+    if isempty(nb_base)
+        % 尝试从 eg 或 mpc_m 推断
+        nb_base = nb;
+        kpi.note = 'nb_base not provided; inferred from bus rows.';
     end
-    dv = Vm_all(mask) - vref;
-    v = sqrt(mean(dv.^2));
-    if ~isfinite(v), v = fail_pen; end
-    kpi.per_hour(:) = v;   % 用同一个快照值填满 24h（用于 RL 反馈的稳定性）
-    kpi.failed_hours = 0;
-    kpi.avg = mean(kpi.per_hour);
-    kpi.max = max(kpi.per_hour);
-    kpi.used = true;
-    kpi.src = "mpng:" + mode + ":nb_total=" + string(nb_total);
-    obj_vdev = kpi.avg;
-    return;
-end
 
-% 多时段：reshape 后逐小时计算
-Vm_mat = reshape(Vm_all(1:nb_per*H), nb_per, H);
+    % 识别 VM 列
+    vm_col = ID.VM;
+    if size(B,2) < vm_col, return; end
 
-per = ones(H,1) * fail_pen;
-failed = 0;
-for tt = 1:H
-    vcol = Vm_mat(:,tt);
-    mask = isfinite(vcol);
-    if ~any(mask)
-        failed = failed + 1;
-        per(tt) = fail_pen;
+    per = fail_pen * ones(1,T);
+
+    if nb == nb_base*T
+        % 按小时堆叠： [bus@t1; bus@t2; ...]
+        VM = reshape(B(:,vm_col), nb_base, T);
+        for tt=1:T
+            v = VM(:,tt);
+            v = v(isfinite(v) & isreal(v));
+            if isempty(v), per(tt) = fail_pen;
+            else, per(tt) = mean(abs(v - vref));
+            end
+        end
+        kpi.used = true;
+        kpi.note = 'VM extracted from eg.mpc.bus stacked by hour.';
+    elseif nb == nb_base
+        % 单快照：当作每小时相同（或最后一小时）
+        v = B(:,vm_col);
+        v = v(isfinite(v) & isreal(v));
+        if isempty(v)
+            per(:) = fail_pen;
+        else
+            per(:) = mean(abs(v - vref));
+        end
+        kpi.used = true;
+        kpi.note = 'VM extracted from single snapshot (replicated across hours).';
     else
-        dv = vcol(mask) - vref;
-        per(tt) = sqrt(mean(dv.^2));
-        if ~isfinite(per(tt)), failed = failed + 1; per(tt) = fail_pen; end
+        % 形状不认识，交给上层 fallback
+        return;
     end
-end
 
-if H == T
+    obj_vdev = mean(per);
     kpi.per_hour = per;
-    kpi.failed_hours = failed;
-    kpi.avg = mean(per);
+    kpi.avg = obj_vdev;
     kpi.max = max(per);
-    kpi.used = true;
-    kpi.src = "mpng:" + mode + ":ok=" + string(H-failed) + ":fail=" + string(failed) + ":nb_per=" + string(nb_per);
-    obj_vdev = kpi.avg;
-else
-    % 时段数不等于 T：用 H 个小时的平均值作为 24h 的代理（最小侵入）
-    vbar = mean(per);
-    if ~isfinite(vbar), vbar = fail_pen; end
-    kpi.per_hour(:) = vbar;
-    kpi.failed_hours = failed;
-    kpi.avg = mean(kpi.per_hour);
-    kpi.max = max(kpi.per_hour);
-    kpi.used = true;
-    kpi.src = "mpng:" + mode + ":inferH=" + string(H) + ":avg_to_T=" + string(T) + ":nb_per=" + string(nb_per);
-    obj_vdev = kpi.avg;
+    kpi.failed_hours = nnz(~isfinite(per)) + nnz(per >= fail_pen-1e-12); % 粗略统计
+catch
+    % 保持默认 fail
 end
 end
 
-function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc_base, Pg_in, ID, T, vref, fail_pen, vdev_pf_enforce_q, PD_NT)
-% 计算 24h 电压偏差（AC PF）
-% - 输入 Pg_in 来自 MOST 的 ExpectedDispatch（可能是 internal 顺序）
-% - 自动映射到 external gen 行顺序；PF 失败时用 fail_pen 兜底，避免 NaN
-% - 默认用 RMS(Vm-1) 作为每小时电压偏差度量
+function [obj_vdev, kpi] = calc_voltage_deviation_acpf(mpc0, Pg2, ID, T, vref, fail_pen, enforce_q, PD_NT)
+% ACPF 后处理电压偏差评估（推荐默认）
+% - 用 PD_NT(:,t) 写入每小时负荷（与主函数构造一致）
+% - Pg2 为 MOST 输出（int 顺序），映射到 ext 后写入 mpc.gen(:,PG)
+% - runpf 成功：per_hour(t)=mean(|Vm-1|)
+% - 失败：per_hour(t)=fail_pen
 
 if nargin < 8, PD_NT = []; end
-if nargin < 7 || isempty(vdev_pf_enforce_q), vdev_pf_enforce_q = 0; end
-if nargin < 6 || isempty(fail_pen), fail_pen = 1.0; end
-if nargin < 5 || isempty(vref),     vref     = 1.0; end
-if nargin < 4 || isempty(T),        T        = size(Pg_in, 2); end
+if nargin < 7 || isempty(enforce_q), enforce_q = false; end
+if nargin < 6 || isempty(fail_pen),  fail_pen  = 0.20;  end
+if nargin < 5 || isempty(vref),      vref      = 1.0;   end
 
-kpi = struct();
-kpi.per_hour     = ones(T,1) * fail_pen;
-kpi.failed_hours = 0;
-kpi.avg          = fail_pen;
-kpi.max          = fail_pen;
-kpi.src          = "acpf:init";
+kpi = struct('used',true,'src','acpf','avg',fail_pen,'max',fail_pen, ...
+    'failed_hours',T,'per_hour',fail_pen*ones(1,T),'note','');
 
-% --- 1) 将 Pg 映射到 external “在线机组”顺序 ---
-[idx_on_ext, Pg_on_ext, map_src] = map_Pg_to_ext_online_vdev(mpc_base, Pg_in, ID);
-kpi.src = "acpf:" + string(map_src);
+obj_vdev = fail_pen;
 
-% ============================================================
-% 4.1 在 vdev 评估前的“输入清洗/对齐/限幅”（强烈推荐）
-% ============================================================
-
-% 4.1.1 空/坏维度直接兜底返回（否则后面很容易全 fail_pen）
-if isempty(idx_on_ext) || isempty(Pg_on_ext) || ndims(Pg_on_ext) ~= 2
-    kpi.failed_hours = T;
-    obj_vdev = fail_pen;
-    return;
-end
-
-% 4.1.2 T 与 Pg_on_ext 列数对齐（避免越界/后面全失败）
-T_eff = min(T, size(Pg_on_ext, 2));
-if T_eff ~= T
-    T = T_eff;
-    kpi.per_hour     = ones(T,1) * fail_pen;
-    kpi.failed_hours = 0;
-end
-
-% 4.1.3 只保留“确实在线”的机组索引（防止混入离线机组导致 PF 更易崩）
-% MATPOWER gen status 列是 8（常量），你也可以用 ID.GEN_STATUS（如果你有）
-GEN_STATUS_COL = 8;
-if size(mpc_base.gen,2) >= GEN_STATUS_COL
-    onmask_all = mpc_base.gen(:, GEN_STATUS_COL) > 0;
-    keep = onmask_all(idx_on_ext);
-    idx_on_ext = idx_on_ext(keep);
-    Pg_on_ext  = Pg_on_ext(keep, 1:T);
-else
-    Pg_on_ext  = Pg_on_ext(:, 1:T);
-end
-
-% 若过滤后没机组了：直接返回 fail_pen
-if isempty(idx_on_ext)
-    kpi.failed_hours = T;
-    obj_vdev = fail_pen;
-    return;
-end
-
-% 4.1.4 修复 Pg 中 NaN/Inf（否则 runpf 很容易炸）
-Pg_on_ext(~isfinite(Pg_on_ext)) = 0;
-
-% 4.1.5 Pg 限幅到 [PMIN, PMAX]（强烈建议；否则一超限就更容易不收敛）
-% MATPOWER gen: PMAX=9, PMIN=10（常量）；若你 ID 里有也可以用 ID.PMAX/ID.PMIN
-PMAX_COL = 9; PMIN_COL = 10;
-if size(mpc_base.gen,2) >= PMIN_COL
-    pmin = mpc_base.gen(idx_on_ext, PMIN_COL);
-else
-    pmin = -inf(numel(idx_on_ext),1);
-end
-if size(mpc_base.gen,2) >= PMAX_COL
-    pmax = mpc_base.gen(idx_on_ext, PMAX_COL);
-else
-    pmax = inf(numel(idx_on_ext),1);
-end
-
-% 兼容老 MATLAB：不用隐式扩展，手动扩展到 (ng_on x T)
-pminM = repmat(pmin, 1, T);
-pmaxM = repmat(pmax, 1, T);
-Pg_on_ext = min(max(Pg_on_ext(:,1:T), pminM), pmaxM);
-
-% ============================================================
-
-% --- 2) PF 选项（尽量安静 + 尽量稳定） ---
-mpopt_pf = mpoption('verbose', 0, 'out.all', 0, ...
-                    'pf.enforce_q_lims', double(logical(vdev_pf_enforce_q)));
-% MATPOWER 8+：优先用 legacy core，避免 mp-core 的 update_z 警告刷屏
 try
-    mpopt_pf = mpoption(mpopt_pf, 'exp.use_legacy_core', 1);
-catch
-    % older MATPOWER：无该选项则忽略
-end
-
-% 先保存 warning 状态（后面恢复）
-w0 = warning;
-
-VM_COL = ID.VM;        % bus(:, VM)
-BUS_TYPE_COL = 2;      % MATPOWER bus type 列固定是 2
-NONE = 4;              % isolated bus type
-
-% --- 3) PD_NT 合法性检查（不合法就当没传） ---
-use_PD_NT = ~isempty(PD_NT) && ismatrix(PD_NT) ...
-            && size(PD_NT,1) == size(mpc_base.bus,1) ...
-            && size(PD_NT,2) >= T;
-
-for tt = 1:T
-    mpc_t = mpc_base;
-    
-    % ====== 4.1 的落地点：在 vdev PF 前写入每小时负荷口径 ======
-    if use_PD_NT
-        mpc_t.bus(:, ID.PD) = PD_NT(:, tt);
-        % 可选：如果你也有 QD_NT，建议同步写入 QD，潮流更一致
-        % mpc_t.bus(:, ID.QD) = QD_NT(:, tt);
+    define_constants;
+    if isempty(Pg2) || size(Pg2,2) ~= T
+        kpi.note = 'Pg2 empty or wrong shape.';
+        return;
     end
 
-    % 写入该小时有功出力（offline 机组保持 0）
-    mpc_t.gen(:, ID.PG) = 0;
-    mpc_t.gen(idx_on_ext, ID.PG) = Pg_on_ext(:,tt);
-
-    % 给所有在线机组一个统一电压设定值，减少 PV/REF 机组 setpoint 缺失引发的异常
-    if isfield(ID, 'VG') && ID.VG > 0
-        mpc_t.gen(idx_on_ext, ID.VG) = vref;
+    if isempty(PD_NT)
+        % 没传就退化为常负荷
+        PD_NT = repmat(mpc0.bus(:,ID.PD), 1, T);
+        kpi.note = 'PD_NT not provided; using constant PD.';
     end
 
-    try
-        ws = warning;                 % 只在 runpf 期间静默（不污染训练输出）
-        warning('off','all');
-        [rpf, success] = runpf(mpc_t, mpopt_pf);
-        warning(ws);
+    % PF 选项
+    mpopt_pf = mpoption('verbose',0,'out.all',0);
+    mpopt_pf = mpoption(mpopt_pf,'pf.alg','NR');
+    mpopt_pf = mpoption(mpopt_pf,'pf.enforce_q_lims', double(logical(enforce_q)));
 
-        if ~success || ~isstruct(rpf) || ~isfield(rpf,'bus') || size(rpf.bus,2) < VM_COL
-            kpi.failed_hours = kpi.failed_hours + 1;
-            kpi.per_hour(tt) = fail_pen;
-            continue;
-        end
+    % ext<->int 映射（把 Pg2(int) 映射回 ext 行）
+    [~, order] = ext2int(mpc0);
+    i2e = order.gen.i2e;
+    ngen_ext = size(mpc0.gen,1);
+    ngen_int = size(Pg2,1);
 
-        Vm = rpf.bus(:, VM_COL);
-        bt = rpf.bus(:, BUS_TYPE_COL);
+    per = fail_pen * ones(1,T);
+    failed = false(1,T);
 
-        mask = (bt ~= NONE) & isfinite(Vm);
-        if ~any(mask)
-            kpi.failed_hours = kpi.failed_hours + 1;
-            kpi.per_hour(tt) = fail_pen;
-            continue;
-        end
+    PD0 = mpc0.bus(:,ID.PD);
+    QD0 = mpc0.bus(:,ID.QD);
 
-        % RMS 偏差（也可以换成 mean(abs(Vm-vref))）
-        dv = Vm(mask) - vref;
-        kpi.per_hour(tt) = sqrt(mean(dv.^2));
+    for tt=1:T
+        m = mpc0;
 
-    catch
-        % PF 异常：计入失败并兜底
-        warning(w0);
-        kpi.failed_hours = kpi.failed_hours + 1;
-        kpi.per_hour(tt) = fail_pen;
-    end
-end
+        % 负荷（P）
+        PDt = PD_NT(:,tt);
+        m.bus(:,ID.PD) = PDt;
 
-kpi.avg = mean(kpi.per_hour);
-kpi.max = max(kpi.per_hour);
+        % 负荷（Q）按功率比例缩放，避免 PF 因 Q 不合理更容易炸
+        ratio = ones(size(PD0));
+        nz = abs(PD0) > 1e-9;
+        ratio(nz) = PDt(nz) ./ PD0(nz);
+        m.bus(:,ID.QD) = QD0 .* ratio;
 
-% 用 avg 作为该目标的标量（可按你的奖励设计替换）
-obj_vdev = kpi.avg;
-end
-
-function [obj_vdev, kpi] = calc_voltage_deviation_acopf(mpc_base, Pg_in, ID, T, vref, fail_pen, fallback_to_pf)
-% 计算 24h 电压偏差（AC OPF 优先，失败回退 PF）
-% - 输入 Pg_in 来自 MOST 的 ExpectedDispatch（可能是 internal 顺序）
-% - 优先使用 runopf(AC) 获取电压幅值 VM；若失败且 fallback_to_pf=true，则回退 runpf
-% - 为提高可行性：将在线机组所在母线提升为 PV（REF 母线保持 REF），并允许 REF 机组吸收网损
-
-if nargin < 7 || isempty(fallback_to_pf), fallback_to_pf = true; end
-if nargin < 6 || isempty(fail_pen),       fail_pen = 1.0; end
-if nargin < 5 || isempty(vref),           vref     = 1.0; end
-if nargin < 4 || isempty(T),              T        = size(Pg_in, 2); end
-
-kpi = struct();
-kpi.per_hour     = ones(T,1) * fail_pen;
-kpi.failed_hours = 0;
-kpi.avg          = fail_pen;
-kpi.max          = fail_pen;
-kpi.acopf_ok_hours = 0;
-kpi.pf_ok_hours   = 0;
-kpi.src          = "acopf:init";
-
-% --- 1) 将 Pg 映射到 external “在线机组”顺序 ---
-[idx_on_ext, Pg_on_ext, map_src] = map_Pg_to_ext_online_vdev(mpc_base, Pg_in, ID);
-kpi.src = "acopf:" + string(map_src);
-
-% --- 2) ACOPF / ACPF 选项 ---
-mpopt_acopf = mpoption('verbose', 0, 'out.all', 0, 'model', 'AC', ...
-    'opf.ac.solver', 'MIPS', 'opf.start', 2, 'opf.violation', 1e-6, ...
-    'pf.enforce_q_lims', 0);
-mpopt_pf    = mpoption('verbose', 0, 'out.all', 0, 'pf.enforce_q_lims', 1);
-
-% MATPOWER 8+：优先用 legacy core，避免 mp-core 的 update_z 警告刷屏
-try
-    mpopt_acopf = mpoption(mpopt_acopf, 'exp.use_legacy_core', 1);
-    mpopt_pf    = mpoption(mpopt_pf,    'exp.use_legacy_core', 1);
-catch
-    % older MATPOWER：无该选项则忽略
-end
-
-% 常量（避免 define_constants 依赖）
-BUS_I_COL    = 1;
-BUS_TYPE_COL = 2;
-PQ  = 1; PV = 2; REF = 3; NONE = 4;
-
-VM_COL = ID.VM;     % bus(:, VM)
-
-% 保存 warning 状态（后面恢复）
-w0 = warning;
-
-for tt = 1:T
-    mpc_t = mpc_base;
-
-    % 写入该小时有功出力（先把所有机组 PG 归零，再写入在线机组）
-    mpc_t.gen(:, ID.PG) = 0;
-    mpc_t.gen(idx_on_ext, ID.PG) = Pg_on_ext(:,tt);
-
-    % 给在线机组一个统一电压设定（如果存在 VG 列）
-    if isfield(ID, 'VG') && ID.VG > 0
-        mpc_t.gen(idx_on_ext, ID.VG) = vref;
-    end
-
-    % --- 2.1 识别/修正 REF 母线（注意：GEN_BUS 是母线编号，不是行号） ---
-    busnum = mpc_t.bus(:, BUS_I_COL);
-
-    ref_row = find(mpc_t.bus(:, BUS_TYPE_COL) == REF, 1);
-    if isempty(ref_row)
-        % 如果没有 REF，选择第一个在线机组的母线作为 REF
-        ref_busnum = mpc_t.gen(idx_on_ext(1), ID.GEN_BUS);
-        ref_row = find(busnum == ref_busnum, 1);
-        if isempty(ref_row), ref_row = 1; end
-        mpc_t.bus(ref_row, BUS_TYPE_COL) = REF;
-    end
-    ref_busnum = mpc_t.bus(ref_row, BUS_I_COL);
-
-    % --- 2.2 将在线机组所在母线提升为 PV（REF 母线保持 REF） ---
-    gbus = unique(mpc_t.gen(idx_on_ext, ID.GEN_BUS));
-    for bb = reshape(gbus, 1, [])
-        brow = find(busnum == bb, 1);
-        if isempty(brow), continue; end
-        if mpc_t.bus(brow, BUS_TYPE_COL) == NONE, continue; end
-        if brow == ref_row
-            mpc_t.bus(brow, BUS_TYPE_COL) = REF;
+        % 写入 Pg（ext）
+        Pg_ext = zeros(ngen_ext,1);
+        if numel(i2e) >= ngen_int
+            Pg_ext(i2e(1:ngen_int)) = Pg2(:,tt);
         else
-            mpc_t.bus(brow, BUS_TYPE_COL) = PV;
+            % 映射不足就尽力而为
+            n = min(numel(i2e), ngen_int);
+            Pg_ext(i2e(1:n)) = Pg2(1:n,tt);
         end
-    end
+        m.gen(:,ID.PG) = Pg_ext;
 
-    % --- 2.3 “锁死”非 REF 机组的 Pg（REF 机组留给网损/不平衡吸收） ---
-    ref_gens = find(mpc_t.gen(:, ID.GEN_STATUS) > 0 & mpc_t.gen(:, ID.GEN_BUS) == ref_busnum);
-
-    % 给 REF 机组放宽有功上下界，便于吸收网损/不平衡（仅用于 vdev 评估）
-    if ~isempty(ref_gens) && isfield(ID,'PMIN') && isfield(ID,'PMAX') && isfield(ID,'PD')
+        % 跑 PF
         try
-            Pload = sum(mpc_t.bus(:, ID.PD));
-            Pmarg = max(1.0, 0.25 * abs(Pload));
-            mpc_t.gen(ref_gens, ID.PMIN) = min(mpc_t.gen(ref_gens, ID.PMIN), -Pmarg);
-            mpc_t.gen(ref_gens, ID.PMAX) = max(mpc_t.gen(ref_gens, ID.PMAX),  Pload + Pmarg);
-        catch
-        end
-    end
-
-    fix_mask = (mpc_t.gen(:, ID.GEN_STATUS) > 0);
-    fix_mask(ref_gens) = false;
-
-    if isfield(ID,'PMIN') && isfield(ID,'PMAX')
-        Pmin0 = mpc_t.gen(:, ID.PMIN);
-        Pmax0 = mpc_t.gen(:, ID.PMAX);
-        Pgfix = mpc_t.gen(:, ID.PG);
-        Pgfix = min(max(Pgfix, Pmin0), Pmax0);
-
-        mpc_t.gen(fix_mask, ID.PG) = Pgfix(fix_mask);
-        % 窄带锁定：给 ACOPF 一点点自由度，显著提升可行性/收敛性
-        p_eps = 1e-3;
-        mpc_t.gen(fix_mask, ID.PMIN) = max(Pmin0(fix_mask), Pgfix(fix_mask) - p_eps);
-        mpc_t.gen(fix_mask, ID.PMAX) = min(Pmax0(fix_mask), Pgfix(fix_mask) + p_eps);
-    end
-
-    % --- 3) 先尝试 ACOPF（若缺 gencost 则跳过直接回退 PF） ---
-    got_vm = false;
-    Vm = [];
-    bt = [];
-
-    if isfield(mpc_t, 'gencost') && ~isempty(mpc_t.gencost)
-        try
-            ws = warning;
-            warning('off','all');
-            [ropf, success] = runopf(mpc_t, mpopt_acopf);
-            warning(ws);
-
-            if success && isstruct(ropf) && isfield(ropf,'bus') && size(ropf.bus,2) >= VM_COL
-                Vm = ropf.bus(:, VM_COL);
-                bt = ropf.bus(:, BUS_TYPE_COL);
-                got_vm = true;
-                kpi.acopf_ok_hours = kpi.acopf_ok_hours + 1;
-            end
-        catch
-            got_vm = false;
-        end
-    end
-
-    % --- 4) ACOPF 失败则回退 PF ---
-    if ~got_vm
-        if fallback_to_pf
-            try
-                ws = warning;
-                warning('off','all');
-                [rpf, success_pf] = runpf(mpc_t, mpopt_pf);
-                warning(ws);
-
-                if success_pf && isstruct(rpf) && isfield(rpf,'bus') && size(rpf.bus,2) >= VM_COL
-                    Vm = rpf.bus(:, VM_COL);
-                    bt = rpf.bus(:, BUS_TYPE_COL);
-                    got_vm = true;
-                    kpi.pf_ok_hours = kpi.pf_ok_hours + 1;
+            r = runpf(m, mpopt_pf);
+            if isfield(r,'success') && r.success
+                Vm = r.bus(:,ID.VM);
+                Vm = Vm(isfinite(Vm) & isreal(Vm));
+                if isempty(Vm)
+                    per(tt) = fail_pen; failed(tt)=true;
+                else
+                    per(tt) = mean(abs(Vm - vref));
                 end
-            catch
-                got_vm = false;
+            else
+                per(tt) = fail_pen; failed(tt)=true;
             end
+        catch
+            per(tt) = fail_pen; failed(tt)=true;
         end
     end
 
-    if ~got_vm
-        kpi.failed_hours = kpi.failed_hours + 1;
-        kpi.per_hour(tt) = fail_pen;
-        continue;
-    end
-
-    mask = (bt ~= NONE) & isfinite(Vm);
-    if ~any(mask)
-        kpi.failed_hours = kpi.failed_hours + 1;
-        kpi.per_hour(tt) = fail_pen;
-        continue;
-    end
-
-    dv = Vm(mask) - vref;
-    kpi.per_hour(tt) = sqrt(mean(dv.^2));   % RMS 偏差
+    obj_vdev = mean(per);
+    kpi.per_hour = per;
+    kpi.avg = obj_vdev;
+    kpi.max = max(per);
+    kpi.failed_hours = nnz(failed);
+catch
+    % keep default
+end
 end
 
-kpi.avg = mean(kpi.per_hour);
-kpi.max = max(kpi.per_hour);
+function [obj_vdev, kpi] = calc_voltage_deviation_acopf(mpc0, Pg2, ID, T, vref, fail_pen, fallback_to_pf, p_eps, enforce_q, PD_NT)
+% “固定 Pg(t) 的 ACOPF 评估”
+% - 除平衡母线(REF)上的机组外：PMIN=PMAX=Pg_sched（夹到原边界）
+% - REF 机组允许调整以补 AC 损耗，避免“固定全部Pg导致必不可行”
+% - 若 ACOPF 失败：可回退 runpf（保持同一小时负荷 & Pg）
 
+if nargin < 10, PD_NT = []; end
+if nargin < 9 || isempty(enforce_q), enforce_q = false; end
+if nargin < 8 || isempty(p_eps),     p_eps = 1e-6; end
+if nargin < 7 || isempty(fallback_to_pf), fallback_to_pf = true; end
+if nargin < 6 || isempty(fail_pen),  fail_pen  = 0.20;  end
+if nargin < 5 || isempty(vref),      vref      = 1.0;   end
 
-kpi.src = "acopf:" + string(map_src) + ":ok_acopf=" + string(kpi.acopf_ok_hours) + ...
-          ":ok_pf=" + string(kpi.pf_ok_hours) + ":fail=" + string(kpi.failed_hours);
-obj_vdev = kpi.avg;
+kpi = struct('used',true,'src','acopf-fixedPg','avg',fail_pen,'max',fail_pen, ...
+    'failed_hours',T,'per_hour',fail_pen*ones(1,T),'note','');
 
-warning(w0);
+obj_vdev = fail_pen;
+
+try
+    define_constants;
+    if isempty(Pg2) || size(Pg2,2) ~= T
+        kpi.note = 'Pg2 empty or wrong shape.';
+        return;
+    end
+
+    if isempty(PD_NT)
+        PD_NT = repmat(mpc0.bus(:,ID.PD), 1, T);
+        kpi.note = 'PD_NT not provided; using constant PD.';
+    end
+
+    % OPF options
+    mpopt_ac = mpoption('verbose',0,'out.all',0);
+    mpopt_ac = mpoption(mpopt_ac,'opf.ac.solver','MIPS');
+    mpopt_ac = mpoption(mpopt_ac,'pf.enforce_q_lims', double(logical(enforce_q)));
+
+    % 映射 Pg2(int) -> ext
+    [~, order] = ext2int(mpc0);
+    i2e = order.gen.i2e;
+    ngen_ext = size(mpc0.gen,1);
+    ngen_int = size(Pg2,1);
+
+    % 找 REF 母线（平衡母线）上的机组
+    ref_bus = find(mpc0.bus(:,BUS_TYPE)==REF, 1);
+    if isempty(ref_bus), ref_bus = 1; end
+    is_ref_gen = (mpc0.gen(:,GEN_BUS) == mpc0.bus(ref_bus,BUS_I));
+
+    PD0 = mpc0.bus(:,ID.PD);
+    QD0 = mpc0.bus(:,ID.QD);
+
+    per = fail_pen * ones(1,T);
+    failed = false(1,T);
+
+    for tt=1:T
+        m = mpc0;
+
+        % 负荷 P/Q
+        PDt = PD_NT(:,tt);
+        m.bus(:,ID.PD) = PDt;
+
+        ratio = ones(size(PD0));
+        nz = abs(PD0) > 1e-9;
+        ratio(nz) = PDt(nz) ./ PD0(nz);
+        m.bus(:,ID.QD) = QD0 .* ratio;
+
+        % 写入 Pg(ext)
+        Pg_ext = zeros(ngen_ext,1);
+        if numel(i2e) >= ngen_int
+            Pg_ext(i2e(1:ngen_int)) = Pg2(:,tt);
+        else
+            n = min(numel(i2e), ngen_int);
+            Pg_ext(i2e(1:n)) = Pg2(1:n,tt);
+        end
+        m.gen(:,ID.PG) = Pg_ext;
+
+        % 固定非REF机组出力（夹到原边界）
+        for g = 1:ngen_ext
+            if is_ref_gen(g), continue; end
+            pmin0 = m.gen(g,PMIN);
+            pmax0 = m.gen(g,PMAX);
+            p = Pg_ext(g);
+
+            % clip to [pmin0, pmax0] with small eps
+            p = min(pmax0 - p_eps, max(pmin0 + p_eps, p));
+            m.gen(g,PMIN) = p;
+            m.gen(g,PMAX) = p;
+            m.gen(g,PG)   = p;
+        end
+
+        % runopf
+        ok = false;
+        try
+            r = runopf(m, mpopt_ac);
+            ok = isfield(r,'success') && r.success;
+            if ok
+                Vm = r.bus(:,VM);
+                Vm = Vm(isfinite(Vm) & isreal(Vm));
+                if isempty(Vm)
+                    per(tt)=fail_pen; failed(tt)=true;
+                else
+                    per(tt)=mean(abs(Vm - vref));
+                end
+            end
+        catch
+            ok = false;
+        end
+
+        % fallback to PF
+        if ~ok
+            if fallback_to_pf
+                try
+                    [pf_v, ~] = calc_voltage_deviation_acpf(mpc0, Pg2(:,tt), ID, 1, vref, fail_pen, enforce_q, PD_NT(:,tt));
+                    per(tt) = pf_v;
+                    % 上面这个调用是“1小时模式”，内部会返回平均偏差（标量）
+                catch
+                    per(tt)=fail_pen; failed(tt)=true;
+                end
+            else
+                per(tt)=fail_pen; failed(tt)=true;
+            end
+        end
+    end
+
+    obj_vdev = mean(per);
+    kpi.per_hour = per;
+    kpi.avg = obj_vdev;
+    kpi.max = max(per);
+    kpi.failed_hours = nnz(failed);
+
+catch
+    % keep default
+end
 end
 
 function [idx_on_ext, Pg_on_ext, src] = map_Pg_to_ext_online_vdev(mpc_ext, Pg_in, ID)
@@ -3174,4 +3067,42 @@ end
 
 Pg_on_ext = cand{best};
 src = csrc{best};
+end
+
+function [VaR, CVaR, tail_idx] = local_cvar(x, alpha)
+% 对 “loss 向量 x（越大越糟）” 计算 VaR_alpha 与 CVaR_alpha（上尾）
+% - alpha=0.95 表示取最差 5% 的均值作为 CVaR
+% - tail_idx 返回落入尾部的原始索引（便于你定位是哪几个小时最危险）
+
+x0 = double(x(:));
+mask = isfinite(x0) & isreal(x0);
+idx0 = find(mask);
+xv = x0(mask);
+
+tail_idx = [];
+if isempty(xv)
+    VaR  = NaN;
+    CVaR = NaN;
+    return;
+end
+
+alpha = double(alpha);
+if ~isfinite(alpha), alpha = 0.95; end
+alpha = min(max(alpha, 0), 0.999999);
+
+% 用排序法做分位数（避免依赖统计工具箱）
+xs = sort(xv, 'ascend');
+n  = numel(xs);
+k  = max(1, ceil(alpha * n));
+VaR = xs(k);
+
+% 上尾集合：x >= VaR
+tail_mask = (x0 >= (VaR - 1e-12)) & mask;
+tail_idx  = find(tail_mask);
+
+tail_vals = x0(tail_idx);
+if isempty(tail_vals)
+    tail_vals = xs(k:end);
+end
+CVaR = mean(tail_vals);
 end
