@@ -1,3 +1,4 @@
+
 clc; clear; close all;
 %% ---------------- 0) 输入 ----------------
 global ENV
@@ -160,6 +161,66 @@ for i = 1:numel(names)
     end
 end
 
+%% ---------------- 5.5) 其他对比方法（非 RL Baselines） ----------------
+baseline = struct();
+
+% 评估口径：与 evaluateAgentSimple 一致（每回合 Return = sum(reward)）
+baseline.EvalEpisodes = cfg.EvalEpisodes;
+baseline.MaxSteps     = cfg.MaxSteps;
+
+% 为了让黑箱搜索别太慢：搜索阶段用更少回合做近似评估，最终再用 EvalEpisodes 复评
+baseline.SearchEvalEpisodes = 2;
+
+% 随机搜索次数（按你 iter_couple 的耗时调）
+baseline.RandomN = 120;
+
+lb = ENV.cap_min(:);
+ub = ENV.cap_max(:);
+
+% --- 1) 固定策略（非常必要的常识基线） ---
+baseCaps = struct();
+baseCaps.CAP_MIN = lb;
+baseCaps.CAP_MID = (lb + ub)/2;
+baseCaps.CAP_MAX = ub;
+
+% --- 2) Random Search（黑箱强基线） ---
+[cap_randbest, randHist] = baseline_random_search(env, lb, ub, baseline.RandomN, ...
+    baseline.SearchEvalEpisodes, baseline.MaxSteps, cfg.Seed+1000);
+baseCaps.RAND = cap_randbest;
+
+% --- 3) GA / PSO / fmincon（有工具箱就用，没有就自动跳过） ---
+baseCaps.GA      = baseline_try_ga(env, lb, ub, baseCaps.CAP_MID, baseline, cfg.Seed+2000);
+baseCaps.PSO     = baseline_try_pso(env, lb, ub, baseCaps.CAP_MID, baseline, cfg.Seed+3000);
+baseCaps.FMINCON = baseline_try_fmincon(env, lb, ub, baseCaps.CAP_MID, baseline, cfg.Seed+4000);
+
+% --- 4) 统一复评（EvalEpisodes）并写入 results ---
+bNames = fieldnames(baseCaps);
+results.baseline = struct();
+
+fprintf('\n================= Evaluating Baselines =================\n');
+for k = 1:numel(bNames)
+    bn  = bNames{k};
+    cap = baseCaps.(bn);
+
+    try
+        s = evaluateFixedCapPolicy(env, cap, baseline.EvalEpisodes, baseline.MaxSteps, cfg.Seed+5000+k);
+        results.baseline.(bn).cap  = cap;
+        results.baseline.(bn).eval = s;
+        fprintf('%s | meanReturn=%.4f  std=%.4f  bestReturn=%.4f\n', ...
+            bn, s.meanReturn, s.stdReturn, s.bestReturn);
+    catch ME
+        warning('Baseline %s eval failed: %s', bn, ME.message);
+        results.baseline.(bn).cap  = cap;
+        results.baseline.(bn).eval = [];
+    end
+end
+
+% 可选：保存 baseline 搜索过程
+try
+    save('baseline_search.mat', 'baseCaps', 'randHist', 'baseline');
+catch
+end
+
 %% ---------------- 6) 打印汇总 ----------------
 fprintf('\n================= Summary =================\n');
 for i = 1:numel(names)
@@ -172,6 +233,21 @@ for i = 1:numel(names)
         fprintf('%s | (no eval result)\n', name);
     end
 end
+% ---- Baseline summary ----
+if isfield(results,'baseline')
+    bNames = fieldnames(results.baseline);
+    for k = 1:numel(bNames)
+        bn = bNames{k};
+        ev = results.baseline.(bn).eval;
+        if ~isempty(ev)
+            fprintf('BASE-%s | meanReturn=%.4f  std=%.4f  bestReturn=%.4f\n', ...
+                bn, ev.meanReturn, ev.stdReturn, ev.bestReturn);
+        else
+            fprintf('BASE-%s | (no eval result)\n', bn);
+        end
+    end
+end
+
 
 %% ---------------- 7) 训练曲线对比（四算法叠加） ----------------
 try
