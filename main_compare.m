@@ -1,4 +1,3 @@
-
 clc; clear; close all;
 %% ---------------- 0) 输入 ----------------
 global ENV
@@ -172,7 +171,7 @@ baseline.MaxSteps     = cfg.MaxSteps;
 baseline.SearchEvalEpisodes = 2;
 
 % 随机搜索次数（按你 iter_couple 的耗时调）
-baseline.RandomN = 120;
+baseline.RandomN = cfg.MaxEpisodes;
 
 lb = ENV.cap_min(:);
 ub = ENV.cap_max(:);
