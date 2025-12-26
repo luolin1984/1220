@@ -33,6 +33,22 @@ ENV.norm.gas_ref     = 1.0;  % normalize gas_risk by this (tune)
 ENV.norm.vdev_cap    = 0.20;  % voltage dev cap (pu)
 ENV.norm.dA_lambda   = 0.05;  % action-rate penalty weight (tune)
 
+ENV.norm.cvar_alpha = 0.10;   % CVaR top-10% tail
+ENV.constr.vdev_limit = 0.05; % 电压偏差 CVaR 约束阈值（示例，按你系统修）
+ENV.constr.gas_limit  = 0.10; % 气网风险阈值（按 gas_risk 定义修）
+
+ENV.cmdp.nConstr   = 2;
+ENV.cmdp.lambda_lr = 0.05;    % 对偶步长
+ENV.cmdp.lambda_max = 50;
+ENV.cmdp.quad_rho  = 0.00;    % 二次惩罚可先关
+ENV.cmdp.eps = [0;0];         % 允许的软容忍
+
+ENV.terminate_on_bad = true;
+
+% 多场景随机性（可选）
+ENV.seed_base = 1234;
+ENV.seed_span = 100000;
+
 % --- hard-fail behavior ---
 ENV.bad_reward = -1.0;        % only used on hard failures
 ENV.hard_fail_on_invalid_kpi = false; % if true, any NaN/Inf KPI => hard fail
@@ -41,7 +57,7 @@ ENV.verbose_live = true;
 ENV.MaxSteps = 5;
 
 %% ---------------- 2) 构造 RL 环境 ----------
-obsDim = 4;
+obsDim = 5;
 actDim = numel(ENV.cap_min);
 
 obsInfo = rlNumericSpec([obsDim 1], "LowerLimit", zeros(obsDim,1), "UpperLimit", ones(obsDim,1));
